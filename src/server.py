@@ -47,14 +47,23 @@ engine = None
 tts_backend = None
 
 
+def _audio_backend():
+    """AUDIO_BACKEND=gpu|cpu, AUDIO_THREADS=<n> (0 = library default).
+    Note: the current gemma-4-E2B .litertlm requires cpu for audio."""
+    if os.environ.get("AUDIO_BACKEND", "cpu").lower() == "gpu":
+        return litert_lm.Backend.GPU()
+    threads = int(os.environ.get("AUDIO_THREADS", "0"))
+    return litert_lm.Backend.CPU(thread_count=threads or None)
+
+
 def load_models():
     global engine, tts_backend
     print(f"Loading Gemma 4 E2B from {MODEL_PATH}...")
     engine = litert_lm.Engine(
         MODEL_PATH,
-        backend=litert_lm.Backend.GPU,
-        vision_backend=litert_lm.Backend.GPU,
-        audio_backend=litert_lm.Backend.CPU,
+        backend=litert_lm.Backend.GPU(),
+        vision_backend=litert_lm.Backend.GPU(),
+        audio_backend=_audio_backend(),
     )
     engine.__enter__()
     print("Engine loaded.")
