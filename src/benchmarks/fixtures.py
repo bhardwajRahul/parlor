@@ -98,6 +98,25 @@ def load_wav_b64(name: str) -> str:
     return base64.b64encode((FIXTURES_DIR / f"{name}.wav").read_bytes()).decode()
 
 
+def load_wav_chunks_b64(name: str, chunk_s: float = 3.0) -> list[str]:
+    """Fixture audio sliced into WAV-encoded chunks, as the streaming client
+    sends them during speech (arbitrary sample boundaries)."""
+    with wave.open(str(FIXTURES_DIR / f"{name}.wav"), "rb") as w:
+        sr = w.getframerate()
+        pcm = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
+    step = int(chunk_s * sr)
+    chunks = []
+    for start in range(0, len(pcm), step):
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as out:
+            out.setnchannels(1)
+            out.setsampwidth(2)
+            out.setframerate(sr)
+            out.writeframes(pcm[start:start + step].tobytes())
+        chunks.append(base64.b64encode(buf.getvalue()).decode())
+    return chunks
+
+
 def make_image_b64(width: int = 320, height: int = 240) -> str:
     """A scene the model can plausibly describe: blue sky over a green field
     with a red circle (sun-like) — drawn with PIL, JPEG-encoded like the frontend."""

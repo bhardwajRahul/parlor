@@ -1,16 +1,27 @@
-"""Parlor — on-device, real-time multimodal AI (voice + vision)."""
+"""Parlor — on-device, real-time multimodal AI (voice + vision).
+
+LLM inference runs on llama.cpp (llama-server, spawned as a subprocess).
+The server owns the conversation history and re-sends it every request;
+llama-server's prefix cache makes that cheap, and it also enables two
+speculative tricks: the camera frame and the user's speech (in ~3s chunks)
+are pushed through cache-priming requests WHILE the user is still talking,
+so the final request only pays for the tail of the utterance.
+"""
 
 import asyncio
 import base64
+import http.client
 import json
 import os
 import re
+import shutil
+import socket
+import subprocess
 import time
 import traceback
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-import litert_lm
 import numpy as np
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -29,20 +40,14 @@ import tts
 from dotenv import load_dotenv
 load_dotenv()
 
-HF_REPO = "litert-community/gemma-4-E2B-it-litert-lm"
-HF_FILENAME = "gemma-4-E2B-it.litertlm"
+# Google's official QAT quant: q4_0 quality trained-in, faster than K-quants.
+HF_GGUF_REPO = "google/gemma-4-E2B-it-qat-q4_0-gguf"
+HF_GGUF_FILE = "gemma-4-E2B_q4_0-it.gguf"
+HF_MMPROJ_FILE = "gemma-4-E2B-it-mmproj.gguf"
 
-
-def resolve_model_path() -> str:
-    path = os.environ.get("MODEL_PATH", "")
-    if path:
-        return path
-    from huggingface_hub import hf_hub_download
-    print(f"Downloading {HF_REPO}/{HF_FILENAME} (first run only)...")
-    return hf_hub_download(repo_id=HF_REPO, filename=HF_FILENAME)
-
-
-MODEL_PATH = resolve_model_path()
+LLAMA_PORT = int(os.environ.get("LLAMA_PORT", "8081"))
+LLAMA_URL = os.environ.get("LLAMA_SERVER_URL", "")  # set to use an external server
+LLAMA_CTX = int(os.environ.get("LLAMA_CTX", "16384"))
 
 # The reply streams straight into TTS, so the format is: response first
 # (sentences are spoken as they decode), transcript last (it never delays
@@ -85,11 +90,11 @@ NUDGE_PROMPT = (
     "in one short, warm sentence encourage them to continue. No transcript line.)"
 )
 
-# TURN_MODE=two_phase splits each audio turn into two requests on the same
-# conversation: a tiny decision request (audio + "did they finish?" — the
-# audio lands in the KV cache here), then, only when FINISHED, a streaming
-# response request that needs no marker rules at all. Keeps the response
-# prompt clean, which small models repay in quality.
+# TURN_MODE=two_phase splits each audio turn into two requests: a tiny
+# decision request (audio + "did they finish?"), then, only when FINISHED, a
+# streaming response request with the same audio in the same turn but a clean
+# instruction. The prefix cache shares the audio between the two, and neither
+# request pollutes the stored history.
 TURN_MODE = os.environ.get("TURN_MODE", "marker")  # marker | two_phase
 
 SYSTEM_PROMPT_TWO_PHASE = (
@@ -119,14 +124,6 @@ NUDGE_PROMPT_TWO_PHASE = (
     "sentence, encourage them to continue. No transcript line.)"
 )
 
-# Sent as a tiny standalone turn the moment the user STARTS speaking, so the
-# ~274 image tokens are already in the KV cache when the audio arrives —
-# cuts camera-turn time-to-first-token by ~75%.
-FRAME_PROMPT = (
-    "This is the user's current camera view; they are about to speak. "
-    "Reply with only the word OK."
-)
-
 # Accept close marker variants ("FINISH", trailing colon, markdown wrap) —
 # they never appear as the first word of a real response in uppercase.
 MARKER_RE = re.compile(r"[\s*_]*(FINISHED|FINISH|WAITING|WAIT)\b[:.]?[\s*_]*")
@@ -141,51 +138,80 @@ TRANSCRIPT_TAG = "###TRANSCRIPT:"
 SENTENCE_END_RE = re.compile(r"[.!?]+\s")
 MAX_OUTPUT_TOKENS = 256
 
+# Rotate history before the llama context fills. Rough token estimates are
+# fine here — the guard just needs to fire before generation degrades.
+CONTEXT_HEADROOM = 2000
+AUDIO_TOKENS_PER_SEC = 32
+IMAGE_TOKENS = 300
+
 _DONE = object()
 
-# Reserve room for one worst-case turn (camera frame + audio + response)
-# before the KV cache fills — past the limit turns silently come back empty.
-CONTEXT_HEADROOM = 800
-
-engine = None
+llama_proc = None
 tts_backend = None
-context_limit = 32768
 
 
-def _audio_backend():
-    """AUDIO_BACKEND=gpu|cpu, AUDIO_THREADS=<n> (0 = library default).
-    Note: the current gemma-4-E2B .litertlm requires cpu for audio."""
-    if os.environ.get("AUDIO_BACKEND", "cpu").lower() == "gpu":
-        return litert_lm.Backend.GPU()
-    threads = int(os.environ.get("AUDIO_THREADS", "0"))
-    return litert_lm.Backend.CPU(thread_count=threads or None)
+def resolve_model_paths() -> tuple[str, str]:
+    model = os.environ.get("MODEL_PATH", "")
+    mmproj = os.environ.get("MMPROJ_PATH", "")
+    if model and mmproj:
+        return model, mmproj
+    from huggingface_hub import hf_hub_download
+    kw = {}
+    try:
+        model = model or hf_hub_download(HF_GGUF_REPO, HF_GGUF_FILE)
+        mmproj = mmproj or hf_hub_download(HF_GGUF_REPO, HF_MMPROJ_FILE)
+    except Exception:  # offline — use the local cache
+        kw = {"local_files_only": True}
+        model = model or hf_hub_download(HF_GGUF_REPO, HF_GGUF_FILE, **kw)
+        mmproj = mmproj or hf_hub_download(HF_GGUF_REPO, HF_MMPROJ_FILE, **kw)
+    return model, mmproj
 
 
-def _vision_backend():
-    """VISION_BACKEND=gpu|none — use none for model files without a vision
-    encoder (e.g. the current gemma-4-12B .litertlm)."""
-    if os.environ.get("VISION_BACKEND", "gpu").lower() == "none":
-        return None
-    return litert_lm.Backend.GPU()
+def llama_host_port() -> tuple[str, int]:
+    if LLAMA_URL:
+        host = LLAMA_URL.split("//")[-1]
+        h, _, p = host.partition(":")
+        return h, int(p or 80)
+    return "127.0.0.1", LLAMA_PORT
+
+
+def start_llama_server():
+    global llama_proc
+    if LLAMA_URL:
+        print(f"Using external llama-server at {LLAMA_URL}")
+        return
+    binary = shutil.which("llama-server")
+    if not binary:
+        raise RuntimeError("llama-server not found — install with: brew install llama.cpp")
+    model, mmproj = resolve_model_paths()
+    print(f"Starting llama-server with {Path(model).name} (ctx={LLAMA_CTX})...")
+    llama_proc = subprocess.Popen(
+        [binary, "-m", model, "--mmproj", mmproj, "-ngl", "99",
+         "--port", str(LLAMA_PORT), "-c", str(LLAMA_CTX), "-np", "1"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    host, port = llama_host_port()
+    deadline = time.time() + 180
+    while time.time() < deadline:
+        if llama_proc.poll() is not None:
+            raise RuntimeError(f"llama-server exited with code {llama_proc.returncode}")
+        try:
+            conn = http.client.HTTPConnection(host, port, timeout=2)
+            conn.request("GET", "/health")
+            ok = conn.getresponse().status == 200
+            conn.close()
+            if ok:
+                print("llama-server ready.")
+                return
+        except OSError:
+            pass
+        time.sleep(1)
+    raise RuntimeError("llama-server did not become ready in 180s")
 
 
 def load_models():
-    global engine, tts_backend, context_limit
-    print(f"Loading Gemma 4 E2B from {MODEL_PATH}...")
-    # KV-cache size. The runtime default (4096) silently kills the
-    # conversation after ~9 camera exchanges: turns come back empty with no
-    # error. 32768 costs ~0.5 GB extra RAM and nothing measurable in latency.
-    context_limit = int(os.environ.get("MAX_NUM_TOKENS", "32768"))
-    engine = litert_lm.Engine(
-        MODEL_PATH,
-        backend=litert_lm.Backend.GPU(),
-        vision_backend=_vision_backend(),
-        audio_backend=_audio_backend(),
-        max_num_tokens=context_limit,
-    )
-    engine.__enter__()
-    print(f"Engine loaded (max_num_tokens={context_limit}).")
-
+    global tts_backend
+    start_llama_server()
     tts_backend = tts.load()
 
 
@@ -193,6 +219,8 @@ def load_models():
 async def lifespan(app):
     await asyncio.get_event_loop().run_in_executor(None, load_models)
     yield
+    if llama_proc:
+        llama_proc.terminate()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -202,6 +230,125 @@ app = FastAPI(lifespan=lifespan)
 async def root():
     return HTMLResponse(content=(Path(__file__).parent / "index.html").read_text())
 
+
+# ── llama-server chat API ─────────────────────────────────────────────────
+
+def _chat_body(messages: list, max_tokens: int, stream: bool) -> dict:
+    return {
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": 0,
+        "stream": stream,
+        "cache_prompt": True,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+
+
+def chat_blocking(messages: list, max_tokens: int) -> str:
+    """Non-streaming request; returns the message content ('' on discard)."""
+    host, port = llama_host_port()
+    conn = http.client.HTTPConnection(host, port, timeout=300)
+    conn.request("POST", "/v1/chat/completions",
+                 json.dumps(_chat_body(messages, max_tokens, stream=False)),
+                 {"Content-Type": "application/json"})
+    resp = conn.getresponse()
+    data = json.loads(resp.read())
+    conn.close()
+    if "error" in data:
+        raise RuntimeError(f"llama-server: {data['error']}")
+    return data["choices"][0]["message"].get("content") or ""
+
+
+class ChatStream:
+    """Streaming chat request, driven from an executor thread. cancel() is
+    thread-safe and actually aborts generation server-side (the connection
+    close is observed by llama-server)."""
+
+    def __init__(self, messages: list, max_tokens: int):
+        self.body = _chat_body(messages, max_tokens, stream=True)
+        self.conn = None
+        self.cancelled = False
+
+    def run(self, on_delta):
+        host, port = llama_host_port()
+        self.conn = http.client.HTTPConnection(host, port, timeout=300)
+        self.conn.request("POST", "/v1/chat/completions", json.dumps(self.body),
+                          {"Content-Type": "application/json"})
+        resp = self.conn.getresponse()
+        try:
+            while True:
+                line = resp.readline()
+                if not line:
+                    break
+                line = line.strip()
+                if not line.startswith(b"data: "):
+                    continue
+                payload = line[6:]
+                if payload == b"[DONE]":
+                    break
+                delta = json.loads(payload)["choices"][0].get("delta", {})
+                text = delta.get("content")
+                if text:
+                    on_delta(text)
+        except Exception as e:
+            # Any failure here means the stream is dead — including
+            # http.client's own cleanup racing a cancel() from another thread
+            # (it can raise AttributeError from _close_conn). Truncation is
+            # normal on abort; a genuinely dead llama-server surfaces on the
+            # next request.
+            if not self.cancelled:
+                print(f"LLM stream ended early: {type(e).__name__}: {e}")
+        finally:
+            try:
+                self.conn.close()
+            except OSError:
+                pass
+
+    def cancel(self):
+        self.cancelled = True
+        try:
+            if self.conn and self.conn.sock:
+                self.conn.sock.shutdown(socket.SHUT_RDWR)
+            if self.conn:
+                self.conn.close()
+        except OSError:
+            pass
+
+
+# ── content helpers ───────────────────────────────────────────────────────
+
+def image_part(b64: str) -> dict:
+    return {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + b64}}
+
+
+def audio_part(b64: str) -> dict:
+    return {"type": "input_audio", "input_audio": {"data": b64, "format": "wav"}}
+
+
+def text_part(text: str) -> dict:
+    return {"type": "text", "text": text}
+
+
+def estimate_tokens(messages: list) -> int:
+    total = 0
+    for m in messages:
+        content = m.get("content")
+        if isinstance(content, str):
+            total += len(content) // 4 + 8
+            continue
+        for p in content:
+            if p["type"] == "text":
+                total += len(p["text"]) // 4
+            elif p["type"] == "input_audio":
+                wav_bytes = len(p["input_audio"]["data"]) * 3 // 4
+                total += (wav_bytes // 32000) * AUDIO_TOKENS_PER_SEC  # 16kHz s16
+            else:
+                total += IMAGE_TOKENS
+        total += 8
+    return total
+
+
+# ── streaming turn parser (unchanged semantics from the litert version) ───
 
 class StreamParser:
     """Incrementally parses 'FINISHED\\n<response>\\n###TRANSCRIPT: <words>',
@@ -291,77 +438,29 @@ class StreamParser:
         return sentences + ([tail] if tail else []), transcript
 
 
-async def run_frame_turn(conversation, image_b64: str):
-    """Prefill the camera frame while the user is still speaking."""
-    t0 = time.time()
+# ── turn execution ────────────────────────────────────────────────────────
 
-    def produce():
-        for _ in conversation.send_message_async(
-            {"role": "user", "content": [
-                {"type": "image", "blob": image_b64},
-                {"type": "text", "text": FRAME_PROMPT},
-            ]},
-            max_output_tokens=4,
-        ):
-            pass
-
-    try:
-        await asyncio.get_event_loop().run_in_executor(None, produce)
-        print(f"Frame prefilled ({time.time() - t0:.2f}s)")
-        return True
-    except Exception as e:
-        print(f"Frame prefill failed: {e}")
-        return False
-
-
-async def run_decision(conversation, msg: dict) -> tuple[str, float]:
-    """Two-phase mode: tiny classification request. The audio (and any inline
-    image) is prefilled into the conversation here, so the follow-up response
-    request only pays for its short text instruction."""
-    content = []
-    if msg.get("audio"):
-        content.append({"type": "audio", "blob": msg["audio"]})
-    if msg.get("image"):
-        content.append({"type": "image", "blob": msg["image"]})
-    content.append({"type": "text", "text": DECISION_PROMPT})
-
-    t0 = time.time()
-    resp = await asyncio.get_event_loop().run_in_executor(
-        None,
-        lambda: conversation.send_message(
-            {"role": "user", "content": content}, max_output_tokens=6
-        ),
-    )
-    text = "".join(
-        p.get("text", "") for p in resp.get("content", []) if isinstance(p, dict)
-    )
-    verdict = "wait" if "WAIT" in text.upper() else "finished"
-    elapsed = time.time() - t0
-    print(f"Decision ({elapsed:.2f}s): {text.strip()!r} -> {verdict}")
-    return verdict, round(elapsed, 3)
-
-
-async def run_turn(ws: WebSocket, conversation, content: list, interrupted: asyncio.Event,
-                   expect_marker: bool = True, extra_timings: dict | None = None):
-    """Stream one model turn: decode → sentences → TTS, all pipelined."""
+async def run_turn(ws: WebSocket, messages: list, interrupted: asyncio.Event,
+                   active: dict, expect_marker: bool = True,
+                   extra_timings: dict | None = None) -> str:
+    """Stream one model turn: decode → sentences → TTS, all pipelined.
+    Returns the raw generated text (stored verbatim in history so the next
+    request gets a full prefix-cache hit)."""
     loop = asyncio.get_event_loop()
     t0 = time.time()
     timings = dict(extra_timings or {})
 
     chunk_q: asyncio.Queue = asyncio.Queue()
+    stream = ChatStream(messages, MAX_OUTPUT_TOKENS)
+    active["stream"] = stream
+    raw = {"text": ""}
 
     def produce():
         try:
-            for chunk in conversation.send_message_async(
-                {"role": "user", "content": content},
-                max_output_tokens=MAX_OUTPUT_TOKENS,
-            ):
-                text = "".join(
-                    p.get("text", "") for p in chunk.get("content", [])
-                    if isinstance(p, dict)
-                )
-                if text:
-                    loop.call_soon_threadsafe(chunk_q.put_nowait, text)
+            def on_delta(text):
+                raw["text"] += text
+                loop.call_soon_threadsafe(chunk_q.put_nowait, text)
+            stream.run(on_delta)
             loop.call_soon_threadsafe(chunk_q.put_nowait, _DONE)
         except Exception as e:  # surfaced to the consumer loop
             loop.call_soon_threadsafe(chunk_q.put_nowait, e)
@@ -429,17 +528,17 @@ async def run_turn(ws: WebSocket, conversation, content: list, interrupted: asyn
             print(f"LLM ({timings['llm_time']:.2f}s) turn incomplete ({kind})")
             if not interrupted.is_set():
                 await ws.send_text(json.dumps({"type": "turn_incomplete", "kind": kind, **timings}))
-            return
+            return raw["text"]
 
         if not interrupted.is_set():
             await dispatch(tail)
     finally:
+        active["stream"] = None
         sentence_q.put_nowait(_DONE)
         try:
             await tts_task
         finally:
-            # The decode thread writes into `conversation` — it must be done
-            # before the caller can ever tear the conversation down.
+            # The producer thread must be done before anyone reuses the slot.
             await producer
 
     if audio_state["first_audio_at"]:
@@ -454,7 +553,7 @@ async def run_turn(ws: WebSocket, conversation, content: list, interrupted: asyn
 
     if interrupted.is_set():
         print("Interrupted mid-turn")
-        return
+        return raw["text"]
 
     await ws.send_text(json.dumps({
         "type": "turn_final",
@@ -467,44 +566,63 @@ async def run_turn(ws: WebSocket, conversation, content: list, interrupted: asyn
             "type": "audio_end",
             "tts_time": timings.get("tts_time", 0),
         }))
+    return raw["text"]
 
 
-def build_content(msg: dict, frame_prefilled: bool = False) -> list:
-    content = []
+async def prime_cache(messages: list):
+    """Fire-and-discard request that pushes a prompt prefix (camera frame,
+    speech chunks) through llama-server's cache while the user is talking.
+    Content must be media-only appends — a trailing text block would diverge
+    the prefix and kill reuse."""
+    t0 = time.time()
+    try:
+        await asyncio.get_event_loop().run_in_executor(
+            None, lambda: chat_blocking(messages, max_tokens=1))
+        print(f"Primed cache ({time.time() - t0:.2f}s)")
+        return True
+    except Exception as e:
+        print(f"Cache priming failed: {e}")
+        return False
+
+
+def user_content(msg: dict, frame_image: str | None, chunks: list[str]) -> list:
+    """Media parts of the current user turn, in canonical (cache-stable)
+    order: image, speech chunks, final audio."""
+    parts = []
+    image = msg.get("image") or frame_image
+    if image:
+        parts.append(image_part(image))
+    for c in chunks:
+        parts.append(audio_part(c))
     if msg.get("audio"):
-        content.append({"type": "audio", "blob": msg["audio"]})
-    if msg.get("image"):
-        content.append({"type": "image", "blob": msg["image"]})
+        parts.append(audio_part(msg["audio"]))
+    return parts
 
+
+def marker_instruction(msg: dict, has_image: bool) -> str:
     if msg.get("type") == "nudge":
-        content.append({"type": "text", "text": NUDGE_PROMPT if TURN_MODE == "marker" else NUDGE_PROMPT_TWO_PHASE})
-    elif msg.get("audio") and (msg.get("image") or frame_prefilled):
-        content.append({"type": "text", "text": "The user just spoke while showing their camera. Start with FINISHED or WAIT, then respond to what they said, referencing what you see if relevant. End with the ###TRANSCRIPT line."})
-    elif msg.get("audio"):
-        content.append({"type": "text", "text": "The user just spoke to you. Start with FINISHED or WAIT, then respond to what they said. End with the ###TRANSCRIPT line."})
-    elif msg.get("image"):
-        content.append({"type": "text", "text": "The user is showing you their camera. Describe what you see."})
-    else:
-        content.append({"type": "text", "text": msg.get("text", "Hello!")})
-    return content
-
-
-def fresh_conversation():
-    system = SYSTEM_PROMPT if TURN_MODE == "marker" else SYSTEM_PROMPT_TWO_PHASE
-    c = engine.create_conversation(
-        messages=[{"role": "system", "content": system}],
-    )
-    c.__enter__()
-    return c
+        return NUDGE_PROMPT if TURN_MODE == "marker" else NUDGE_PROMPT_TWO_PHASE
+    if msg.get("audio"):
+        base = ("The user just spoke while showing their camera. Start with FINISHED or WAIT, "
+                "then respond to what they said, referencing what you see if relevant."
+                if has_image else
+                "The user just spoke to you. Start with FINISHED or WAIT, then respond to "
+                "what they said.")
+        return base + " End with the ###TRANSCRIPT line."
+    if has_image:
+        return "The user is showing you their camera. Describe what you see."
+    return msg.get("text", "Hello!")
 
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
 
-    conversation = fresh_conversation()
+    system = SYSTEM_PROMPT if TURN_MODE == "marker" else SYSTEM_PROMPT_TWO_PHASE
+    history: list = [{"role": "system", "content": system}]
 
     interrupted = asyncio.Event()
+    active = {"stream": None}
     msg_queue = asyncio.Queue()
 
     async def receiver():
@@ -513,11 +631,10 @@ async def websocket_endpoint(ws: WebSocket):
                 raw = await ws.receive_text()
                 msg = json.loads(raw)
                 if msg.get("type") == "interrupt":
-                    # Suppress output but let decode run out: cancel_process()
-                    # permanently wedges the conversation in litert-lm 0.14
-                    # (the next send_message never returns). Responses are
-                    # short, so the extra busy window is <1s.
                     interrupted.set()
+                    stream = active.get("stream")
+                    if stream:
+                        stream.cancel()  # actually aborts generation
                     print("Client interrupted")
                 else:
                     await msg_queue.put(msg)
@@ -529,64 +646,83 @@ async def websocket_endpoint(ws: WebSocket):
 
     recv_task = asyncio.create_task(receiver())
 
-    frame_prefilled = False
-    pending_frame = None
+    frame_image: str | None = None   # camera frame held for the current utterance
+    speech_chunks: list[str] = []    # streamed-in speech, already cache-primed
+
     try:
         while True:
             msg = await msg_queue.get()
             if msg is None:
                 break
-            # Rotate the conversation before the KV cache fills — losing old
-            # history beats the silent empty-turn failure at the limit.
-            try:
-                tokens = conversation.token_count
-            except RuntimeError:
-                tokens = 0
-            if tokens > context_limit - CONTEXT_HEADROOM:
-                print(f"Context near limit ({tokens}/{context_limit} tokens) — fresh conversation")
-                conversation.__exit__(None, None, None)
-                conversation = fresh_conversation()
-                frame_prefilled = False
+
+            # Rotate history before the llama context fills: keep the system
+            # prompt and the most recent exchanges.
+            if estimate_tokens(history) > LLAMA_CTX - CONTEXT_HEADROOM:
+                keep = 1 + max(2, (len(history) - 1) // 2)
+                print(f"Context near limit — dropping {len(history) - keep} oldest messages")
+                history = [history[0]] + history[-(keep - 1):]
 
             if msg.get("type") == "frame":
-                # Always accept a fresh frame (the client sends at most one
-                # per utterance; a re-send replaces a stale one).
                 if msg.get("image"):
-                    if TURN_MODE == "two_phase":
-                        # A standalone frame turn biases the decision request
-                        # into false WAITs — hold the frame and inject it into
-                        # the decision request instead.
-                        pending_frame = msg["image"]
-                    elif await run_frame_turn(conversation, msg["image"]):
-                        frame_prefilled = True
-                    else:
-                        await ws.send_text(json.dumps({"type": "frame_failed"}))
+                    frame_image = msg["image"]
+                    speech_chunks = []
+                    await prime_cache(history + [
+                        {"role": "user", "content": user_content({}, frame_image, [])}])
                 continue
+
+            if msg.get("type") == "speech_chunk":
+                if msg.get("seq") == 0:
+                    speech_chunks = []
+                if msg.get("audio"):
+                    speech_chunks.append(msg["audio"])
+                    await prime_cache(history + [
+                        {"role": "user", "content": user_content({}, frame_image, speech_chunks)}])
+                continue
+
             interrupted.clear()
+            chunks = speech_chunks if msg.get("chunked") else []
+            content = user_content(msg, frame_image, chunks)
+            has_image = any(p["type"] == "image_url" for p in content)
+            frame_image = None
+            speech_chunks = []
+
             try:
                 if TURN_MODE == "two_phase" and msg.get("audio"):
-                    if pending_frame and not msg.get("image"):
-                        msg = {**msg, "image": pending_frame}
-                    verdict, decision_s = await run_decision(conversation, msg)
+                    decision_messages = history + [
+                        {"role": "user", "content": content + [text_part(DECISION_PROMPT)]}]
+                    t0 = time.time()
+                    verdict_text = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: chat_blocking(decision_messages, max_tokens=6))
+                    decision_s = round(time.time() - t0, 3)
+                    print(f"Decision ({decision_s:.2f}s): {verdict_text.strip()!r}")
                     if interrupted.is_set():
                         continue
-                    if verdict == "wait":
+                    if "WAIT" in verdict_text.upper():
+                        # Keep the unfinished audio in history — it is context
+                        # for the user's continuation.
+                        history.append(decision_messages[-1])
+                        history.append({"role": "assistant", "content": "WAIT"})
                         await ws.send_text(json.dumps({
                             "type": "turn_incomplete", "kind": "short",
                             "decision_s": decision_s,
                         }))
                         continue
-                    camera = (
-                        " Mention what you see on their camera if relevant."
-                        if msg.get("image") else ""
-                    )
-                    content = [{"type": "text", "text": RESPOND_PROMPT.format(camera=camera)}]
-                    await run_turn(ws, conversation, content, interrupted,
-                                   expect_marker=False,
-                                   extra_timings={"decision_s": decision_s})
+                    camera = (" Mention what you see on their camera if relevant."
+                              if has_image else "")
+                    user_msg = {"role": "user",
+                                "content": content + [text_part(RESPOND_PROMPT.format(camera=camera))]}
+                    raw_text = await run_turn(ws, history + [user_msg], interrupted, active,
+                                              expect_marker=False,
+                                              extra_timings={"decision_s": decision_s})
                 else:
-                    await run_turn(ws, conversation, build_content(msg, frame_prefilled),
-                                   interrupted, expect_marker=(TURN_MODE == "marker"))
+                    user_msg = {"role": "user",
+                                "content": content + [text_part(marker_instruction(msg, has_image))]}
+                    raw_text = await run_turn(ws, history + [user_msg], interrupted, active,
+                                              expect_marker=(TURN_MODE == "marker"))
+                # Store the turn verbatim (same bytes → full prefix-cache hit
+                # on the next request).
+                history.append(user_msg)
+                history.append({"role": "assistant", "content": raw_text or "..."})
             except DISCONNECT_ERRORS:
                 raise
             except Exception:
@@ -597,14 +733,10 @@ async def websocket_endpoint(ws: WebSocket):
                     "type": "turn_final", "transcription": None,
                     "timings": {}, "spoke": False,
                 }))
-            finally:
-                frame_prefilled = False
-                pending_frame = None
     except DISCONNECT_ERRORS:
         print("Client disconnected")
     finally:
         recv_task.cancel()
-        conversation.__exit__(None, None, None)
 
 
 if __name__ == "__main__":

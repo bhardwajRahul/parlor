@@ -39,6 +39,9 @@ PERF_TESTS = [
     ("audio_long_image", "long_question", True, None),
     ("audio_short_prefetch", "capital_france", "prefetch", None),
     ("audio_long_prefetch", "long_question", "prefetch", None),
+    # "chunk_stream": speech streamed in ~3s chunks during the utterance
+    # (llama.cpp overlap prefill); t0 is the final-tail send = speech end.
+    ("audio_long_overlap", "long_question", "chunk_stream", None),
 ]
 
 RUNS_PER_TEST = 2
@@ -149,7 +152,14 @@ async def run_perf_suite(url: str) -> dict:
                 if with_image == "prefetch":
                     await ws.send(json.dumps({"type": "frame", "image": fixtures.make_image_b64()}))
                     await asyncio.sleep(1.0)  # frame prefills while the "user speaks"
-                r = await run_turn(ws, build_payload(fixture, with_image is True, text))
+                if with_image == "chunk_stream":
+                    chunks = fixtures.load_wav_chunks_b64(fixture)
+                    for seq, c in enumerate(chunks[:-1]):
+                        await ws.send(json.dumps({"type": "speech_chunk", "seq": seq, "audio": c}))
+                        await asyncio.sleep(1.0)  # server primes while the "user speaks"
+                    r = await run_turn(ws, {"audio": chunks[-1], "chunked": True})
+                else:
+                    r = await run_turn(ws, build_payload(fixture, with_image is True, text))
                 runs.append(r)
             print(
                 f"  {name} run {i + 1}: text={r['t_text']}s "
@@ -182,6 +192,18 @@ async def run_correctness_suite(url: str) -> dict:
 
         r = await run_turn(ws, build_payload(None, True, "What do you see?"))
         checks["image_described"] = len(r["text"].strip()) > 10
+
+    # Chunk-streamed speech must keep the transcript intact end to end.
+    async with connect(url) as ws:
+        chunks = fixtures.load_wav_chunks_b64("long_question")
+        for seq, c in enumerate(chunks[:-1]):
+            await ws.send(json.dumps({"type": "speech_chunk", "seq": seq, "audio": c}))
+            await asyncio.sleep(1.0)
+        r = await run_turn(ws, {"audio": chunks[-1], "chunked": True}, timeout=60)
+        transcript = (r["transcription"] or "").lower()
+        checks["overlap_transcript"] = all(
+            k in transcript for k in fixtures.FIXTURES["long_question"][1])
+        print(f"  overlap_transcript: {transcript[:80]!r}")
 
     # Prefetched-frame grounding: frame sent early, audio asks about the scene.
     async with connect(url) as ws:

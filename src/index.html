@@ -782,6 +782,53 @@ let speakingStartedAt = 0;
 let framePrefetched = false; // server holds an unconsumed camera frame
 const BARGE_IN_GRACE_MS = 800; // Ignore VAD triggers shortly after TTS starts (echo)
 
+// ── Speech chunk streaming ──
+// While the user talks, ship ~3s audio chunks so the server can prefill
+// them into the LLM cache; at speech end only the tail remains to process.
+const CHUNK_SECONDS = 3.0;
+const PRE_FRAMES = 10; // ~320ms of pre-speech context
+let uttFrames = [];    // frames of the current utterance
+let preFrames = [];    // rolling pre-speech buffer
+let uttSamplesSent = 0;
+let chunkSeq = 0;
+let speechActive = false;
+
+function handleVadFrame(frame) {
+  if (speechActive) {
+    uttFrames.push(frame);
+    let total = 0;
+    for (const f of uttFrames) total += f.length;
+    if (total - uttSamplesSent >= CHUNK_SECONDS * 16000) sendSpeechChunk(total);
+  } else {
+    preFrames.push(frame);
+    if (preFrames.length > PRE_FRAMES) preFrames.shift();
+  }
+}
+
+function concatFrames(frames) {
+  let total = 0;
+  for (const f of frames) total += f.length;
+  const out = new Float32Array(total);
+  let off = 0;
+  for (const f of frames) { out.set(f, off); off += f.length; }
+  return out;
+}
+
+function sendSpeechChunk(totalSamples) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const all = concatFrames(uttFrames);
+  const chunk = all.subarray(uttSamplesSent, totalSamples);
+  ws.send(JSON.stringify({ type: 'speech_chunk', seq: chunkSeq++, audio: float32ToWavBase64(chunk) }));
+  uttSamplesSent = totalSamples;
+}
+
+function startUtteranceCapture() {
+  speechActive = true;
+  uttFrames = [...preFrames];
+  uttSamplesSent = 0;
+  chunkSeq = 0;
+}
+
 // Send the camera frame the moment speech STARTS: the server prefills the
 // image tokens while the user is still talking, so the audio turn only pays
 // for the audio (~75% faster first token on camera turns).
@@ -796,7 +843,7 @@ function prefetchFrame() {
 
 function handleSpeechStart() {
   clearNudgeTimer();
-  if (state === 'listening') prefetchFrame();
+  if (state === 'listening') { prefetchFrame(); startUtteranceCapture(); }
   if (state === 'speaking') {
     // Ignore echo: don't allow barge-in right after TTS starts playing
     if (Date.now() - speakingStartedAt < BARGE_IN_GRACE_MS) {
@@ -810,6 +857,7 @@ function handleSpeechStart() {
     }
     setState('listening');
     prefetchFrame();
+    startUtteranceCapture();
     console.log('Barge-in: interrupted playback');
   }
 }
@@ -820,7 +868,6 @@ function handleSpeechEnd(audio) {
 
   clearNudgeTimer();
   nudgesSent = 0;
-  const wavBase64 = float32ToWavBase64(audio);
   // Frame already prefetched at speech start; capture now only as fallback.
   const imageBase64 = framePrefetched ? null : captureFrame();
   const withCamera = framePrefetched || !!imageBase64;
@@ -832,7 +879,16 @@ function handleSpeechEnd(audio) {
 
   currentAssistantEl = null;
   ignoreIncomingAudio = false;
-  const payload = { audio: wavBase64 };
+  const payload = {};
+  if (speechActive && uttSamplesSent > 0) {
+    // Chunks already streamed — send only the un-sent tail.
+    const all = concatFrames(uttFrames);
+    payload.audio = float32ToWavBase64(all.subarray(uttSamplesSent));
+    payload.chunked = true;
+  } else {
+    payload.audio = float32ToWavBase64(audio);
+  }
+  speechActive = false;
   if (imageBase64) payload.image = imageBase64;
   ws.send(JSON.stringify(payload));
 }
@@ -964,8 +1020,10 @@ async function init() {
       // No speech-end will follow — let the next real utterance send a
       // fresh frame instead of pointing the model at this stale one.
       framePrefetched = false;
+      speechActive = false;
       console.log('VAD misfire (too short)');
     },
+    onFrameProcessed: (probs, frame) => handleVadFrame(Float32Array.from(frame)),
     onnxWASMBasePath: "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/",
     baseAssetPath: "https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/",
   });
