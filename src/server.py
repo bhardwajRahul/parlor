@@ -85,6 +85,40 @@ NUDGE_PROMPT = (
     "in one short, warm sentence encourage them to continue. No transcript line.)"
 )
 
+# TURN_MODE=two_phase splits each audio turn into two requests on the same
+# conversation: a tiny decision request (audio + "did they finish?" — the
+# audio lands in the KV cache here), then, only when FINISHED, a streaming
+# response request that needs no marker rules at all. Keeps the response
+# prompt clean, which small models repay in quality.
+TURN_MODE = os.environ.get("TURN_MODE", "marker")  # marker | two_phase
+
+SYSTEM_PROMPT_TWO_PHASE = (
+    "You are a friendly, conversational AI assistant. The user talks to you "
+    "through a microphone and may show you their camera. Your replies are "
+    "spoken aloud, so write plain conversational text without formatting."
+)
+
+DECISION_PROMPT = (
+    "The user just spoke. Judge ONLY whether they finished their thought — "
+    "do not answer them yet. Examples:\n"
+    '"What is your favorite food?" -> FINISHED\n'
+    '"I moved here last year and I want to know how I can make more friends." -> FINISHED\n'
+    '"So the thing I wanted to ask is" -> WAIT\n'
+    '"Hmm, let me think about that." -> WAIT\n'
+    "Reply with exactly one word: FINISHED or WAIT."
+)
+
+RESPOND_PROMPT = (
+    "Respond to what the user said in their audio message: 1-4 short "
+    "sentences, spoken aloud.{camera} Then end your reply with a new line: "
+    "###TRANSCRIPT: followed by the exact words the user said."
+)
+
+NUDGE_PROMPT_TWO_PHASE = (
+    "(The user went quiet without finishing their thought. In one short, warm "
+    "sentence, encourage them to continue. No transcript line.)"
+)
+
 # Sent as a tiny standalone turn the moment the user STARTS speaking, so the
 # ~274 image tokens are already in the KV cache when the audio arrives —
 # cuts camera-turn time-to-first-token by ~75%.
@@ -180,8 +214,9 @@ class StreamParser:
     # Hold back enough of the tail to never TTS a partially-arrived tag.
     TAG_HOLDBACK = len(TRANSCRIPT_TAG) + 2
 
-    def __init__(self):
-        self.kind = None  # complete / incomplete_short / incomplete_long
+    def __init__(self, expect_marker: bool = True):
+        # Without a marker (two-phase mode) everything is response text.
+        self.kind = None if expect_marker else "complete"
         self.response = ""
         self.transcript = ""
         self._pending = ""  # text held until marker-vs-response is decided
@@ -279,11 +314,39 @@ async def run_frame_turn(conversation, image_b64: str):
         return False
 
 
-async def run_turn(ws: WebSocket, conversation, content: list, interrupted: asyncio.Event):
+async def run_decision(conversation, msg: dict) -> tuple[str, float]:
+    """Two-phase mode: tiny classification request. The audio (and any inline
+    image) is prefilled into the conversation here, so the follow-up response
+    request only pays for its short text instruction."""
+    content = []
+    if msg.get("audio"):
+        content.append({"type": "audio", "blob": msg["audio"]})
+    if msg.get("image"):
+        content.append({"type": "image", "blob": msg["image"]})
+    content.append({"type": "text", "text": DECISION_PROMPT})
+
+    t0 = time.time()
+    resp = await asyncio.get_event_loop().run_in_executor(
+        None,
+        lambda: conversation.send_message(
+            {"role": "user", "content": content}, max_output_tokens=6
+        ),
+    )
+    text = "".join(
+        p.get("text", "") for p in resp.get("content", []) if isinstance(p, dict)
+    )
+    verdict = "wait" if "WAIT" in text.upper() else "finished"
+    elapsed = time.time() - t0
+    print(f"Decision ({elapsed:.2f}s): {text.strip()!r} -> {verdict}")
+    return verdict, round(elapsed, 3)
+
+
+async def run_turn(ws: WebSocket, conversation, content: list, interrupted: asyncio.Event,
+                   expect_marker: bool = True, extra_timings: dict | None = None):
     """Stream one model turn: decode → sentences → TTS, all pipelined."""
     loop = asyncio.get_event_loop()
     t0 = time.time()
-    timings = {}
+    timings = dict(extra_timings or {})
 
     chunk_q: asyncio.Queue = asyncio.Queue()
 
@@ -334,7 +397,7 @@ async def run_turn(ws: WebSocket, conversation, content: list, interrupted: asyn
             audio_state["chunks"] += 1
 
     tts_task = asyncio.create_task(tts_worker())
-    parser = StreamParser()
+    parser = StreamParser(expect_marker=expect_marker)
     tts_started_at = None
 
     async def dispatch(sentences: list[str]):
@@ -414,7 +477,7 @@ def build_content(msg: dict, frame_prefilled: bool = False) -> list:
         content.append({"type": "image", "blob": msg["image"]})
 
     if msg.get("type") == "nudge":
-        content.append({"type": "text", "text": NUDGE_PROMPT})
+        content.append({"type": "text", "text": NUDGE_PROMPT if TURN_MODE == "marker" else NUDGE_PROMPT_TWO_PHASE})
     elif msg.get("audio") and (msg.get("image") or frame_prefilled):
         content.append({"type": "text", "text": "The user just spoke while showing their camera. Start with FINISHED or WAIT, then respond to what they said, referencing what you see if relevant. End with the ###TRANSCRIPT line."})
     elif msg.get("audio"):
@@ -427,8 +490,9 @@ def build_content(msg: dict, frame_prefilled: bool = False) -> list:
 
 
 def fresh_conversation():
+    system = SYSTEM_PROMPT if TURN_MODE == "marker" else SYSTEM_PROMPT_TWO_PHASE
     c = engine.create_conversation(
-        messages=[{"role": "system", "content": SYSTEM_PROMPT}],
+        messages=[{"role": "system", "content": system}],
     )
     c.__enter__()
     return c
@@ -466,6 +530,7 @@ async def websocket_endpoint(ws: WebSocket):
     recv_task = asyncio.create_task(receiver())
 
     frame_prefilled = False
+    pending_frame = None
     try:
         while True:
             msg = await msg_queue.get()
@@ -487,14 +552,41 @@ async def websocket_endpoint(ws: WebSocket):
                 # Always accept a fresh frame (the client sends at most one
                 # per utterance; a re-send replaces a stale one).
                 if msg.get("image"):
-                    if await run_frame_turn(conversation, msg["image"]):
+                    if TURN_MODE == "two_phase":
+                        # A standalone frame turn biases the decision request
+                        # into false WAITs — hold the frame and inject it into
+                        # the decision request instead.
+                        pending_frame = msg["image"]
+                    elif await run_frame_turn(conversation, msg["image"]):
                         frame_prefilled = True
                     else:
                         await ws.send_text(json.dumps({"type": "frame_failed"}))
                 continue
             interrupted.clear()
             try:
-                await run_turn(ws, conversation, build_content(msg, frame_prefilled), interrupted)
+                if TURN_MODE == "two_phase" and msg.get("audio"):
+                    if pending_frame and not msg.get("image"):
+                        msg = {**msg, "image": pending_frame}
+                    verdict, decision_s = await run_decision(conversation, msg)
+                    if interrupted.is_set():
+                        continue
+                    if verdict == "wait":
+                        await ws.send_text(json.dumps({
+                            "type": "turn_incomplete", "kind": "short",
+                            "decision_s": decision_s,
+                        }))
+                        continue
+                    camera = (
+                        " Mention what you see on their camera if relevant."
+                        if msg.get("image") else ""
+                    )
+                    content = [{"type": "text", "text": RESPOND_PROMPT.format(camera=camera)}]
+                    await run_turn(ws, conversation, content, interrupted,
+                                   expect_marker=False,
+                                   extra_timings={"decision_s": decision_s})
+                else:
+                    await run_turn(ws, conversation, build_content(msg, frame_prefilled),
+                                   interrupted, expect_marker=(TURN_MODE == "marker"))
             except DISCONNECT_ERRORS:
                 raise
             except Exception:
@@ -507,6 +599,7 @@ async def websocket_endpoint(ws: WebSocket):
                 }))
             finally:
                 frame_prefilled = False
+                pending_frame = None
     except DISCONNECT_ERRORS:
         print("Client disconnected")
     finally:
