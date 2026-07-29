@@ -607,7 +607,21 @@ function setState(newState) {
   } else if (micSource && newState !== 'listening') {
     try { micSource.disconnect(analyser); } catch {}
   }
+
+  // Watchdog: never let 'processing' become a terminal state (e.g. the
+  // server errored without sending a terminal frame).
+  clearTimeout(processingWatchdog);
+  if (newState === 'processing') {
+    processingWatchdog = setTimeout(() => {
+      if (state === 'processing') {
+        console.warn('processing watchdog fired — returning to listening');
+        setState('listening');
+        setStatus('connected', 'Connected');
+      }
+    }, 30000);
+  }
 }
+let processingWatchdog = null;
 
 // ── WebSocket ──
 function connect() {
@@ -617,21 +631,40 @@ function connect() {
     if (state !== 'loading') setState('listening');
   };
   ws.onclose = () => {
+    // A reconnect gets a brand-new server conversation — reset per-turn state.
+    clearNudgeTimer();
     setStatus('disconnected', 'Disconnected');
     setTimeout(connect, 2000);
   };
   ws.onmessage = ({ data }) => {
     const msg = JSON.parse(data);
-    if (msg.type === 'text') {
-      if (msg.transcription) {
-        const userMsgs = messagesDiv.querySelectorAll('.msg.user');
-        const lastUserMsg = userMsgs[userMsgs.length - 1];
-        if (lastUserMsg) {
-          const meta = lastUserMsg.querySelector('.meta');
-          lastUserMsg.innerHTML = `${msg.transcription}${meta ? meta.outerHTML : ''}`;
-        }
+    if (msg.type === 'text_delta') {
+      if (ignoreIncomingAudio) return;
+      appendAssistantText(msg.text);
+    } else if (msg.type === 'turn_incomplete') {
+      // The model judged the user unfinished — keep listening, nudge later.
+      if (ignoreIncomingAudio) { ignoreIncomingAudio = false; return; }
+      removeLastUserLoading();
+      setState('listening');
+      setStatus('connected', 'Connected');
+      startNudgeTimer(msg.kind === 'long' ? 10000 : 5000);
+    } else if (msg.type === 'turn_final') {
+      if (ignoreIncomingAudio) return;
+      const userMsgs = messagesDiv.querySelectorAll('.msg.user');
+      const lastUserMsg = userMsgs[userMsgs.length - 1];
+      if (lastUserMsg && lastUserMsg.querySelector('.loading-dots')) {
+        const meta = lastUserMsg.querySelector('.meta');
+        lastUserMsg.innerHTML = `${msg.transcription || '…'}${meta ? meta.outerHTML : ''}`;
       }
-      addMessage('assistant', msg.text, `LLM ${msg.llm_time}s`);
+      const t = msg.timings || {};
+      if (t.llm_time) {
+        setAssistantMeta(`LLM ${t.llm_time}s` + (t.ttfa_s ? ` · audio @ ${t.ttfa_s}s` : ''));
+      }
+      if (!msg.spoke) {
+        // No audio will follow — return to listening now.
+        setState('listening');
+        setStatus('connected', 'Connected');
+      }
     } else if (msg.type === 'audio_start') {
       if (ignoreIncomingAudio) return;
       streamSampleRate = msg.sample_rate || 24000;
@@ -651,6 +684,62 @@ function connect() {
       if (meta) meta.textContent += ` · TTS ${msg.tts_time}s`;
     }
   };
+}
+
+// ── Streamed assistant message helpers ──
+let currentAssistantEl = null;
+let currentAssistantBodyEl = null;
+
+function appendAssistantText(text) {
+  if (!currentAssistantEl) {
+    currentAssistantEl = document.createElement('div');
+    currentAssistantEl.className = 'msg assistant';
+    currentAssistantEl.innerHTML = '<span class="body"></span>';
+    currentAssistantBodyEl = currentAssistantEl.querySelector('.body');
+    messagesDiv.appendChild(currentAssistantEl);
+  }
+  currentAssistantBodyEl.textContent += text;
+  messagesDiv.scrollTop = messagesDiv.scrollHeight;
+}
+
+function setAssistantMeta(text) {
+  if (!currentAssistantEl) return;
+  let meta = currentAssistantEl.querySelector('.meta');
+  if (!meta) {
+    meta = document.createElement('div');
+    meta.className = 'meta';
+    currentAssistantEl.appendChild(meta);
+  }
+  meta.textContent = text;
+}
+
+function removeLastUserLoading() {
+  const userMsgs = messagesDiv.querySelectorAll('.msg.user');
+  const last = userMsgs[userMsgs.length - 1];
+  if (last && last.querySelector('.loading-dots')) last.remove();
+}
+
+// ── Nudge timer: re-engage after an incomplete turn goes quiet ──
+let nudgeTimer = null;
+let nudgesSent = 0; // capped per silence stretch, reset when the user speaks
+
+function startNudgeTimer(delayMs) {
+  clearNudgeTimer();
+  if (nudgesSent >= 2) return; // don't pester an empty room forever
+  nudgeTimer = setTimeout(() => {
+    nudgeTimer = null;
+    if (state === 'listening' && ws && ws.readyState === WebSocket.OPEN) {
+      nudgesSent++;
+      currentAssistantEl = null;
+      ws.send(JSON.stringify({ type: 'nudge' }));
+      setState('processing');
+      setStatus('processing', 'Processing');
+    }
+  }, delayMs);
+}
+
+function clearNudgeTimer() {
+  if (nudgeTimer) { clearTimeout(nudgeTimer); nudgeTimer = null; }
 }
 
 function setStatus(cls, text) { statusEl.className = `status-pill ${cls}`; statusEl.textContent = text; }
@@ -690,6 +779,7 @@ let speakingStartedAt = 0;
 const BARGE_IN_GRACE_MS = 800; // Ignore VAD triggers shortly after TTS starts (echo)
 
 function handleSpeechStart() {
+  clearNudgeTimer();
   if (state === 'speaking') {
     // Ignore echo: don't allow barge-in right after TTS starts playing
     if (Date.now() - speakingStartedAt < BARGE_IN_GRACE_MS) {
@@ -710,13 +800,18 @@ function handleSpeechEnd(audio) {
   if (state !== 'listening') return;
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
+  clearNudgeTimer();
+  nudgesSent = 0;
   const wavBase64 = float32ToWavBase64(audio);
   const imageBase64 = captureFrame();
+  const withCamera = !!imageBase64;
 
   setState('processing');
   setStatus('processing', 'Processing');
-  addMessage('user', '<span class="loading-dots"><span></span><span></span><span></span></span>', imageBase64 ? 'with camera' : '');
+  addMessage('user', '<span class="loading-dots"><span></span><span></span><span></span></span>', withCamera ? 'with camera' : '');
 
+  currentAssistantEl = null;
+  ignoreIncomingAudio = false;
   const payload = { audio: wavBase64 };
   if (imageBase64) payload.image = imageBase64;
   ws.send(JSON.stringify(payload));
@@ -838,7 +933,9 @@ async function init() {
     getStream: async () => new MediaStream(mediaStream.getAudioTracks()),
     positiveSpeechThreshold: 0.5,
     negativeSpeechThreshold: 0.25,
-    redemptionMs: 600,
+    // Short redemption for fast turn-taking; the LLM's turn markers catch
+    // the cases where the user was merely pausing (see SYSTEM_PROMPT).
+    redemptionMs: 200,
     minSpeechMs: 300,
     preSpeechPadMs: 300,
     onSpeechStart: handleSpeechStart,
