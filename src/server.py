@@ -109,8 +109,13 @@ MAX_OUTPUT_TOKENS = 256
 
 _DONE = object()
 
+# Reserve room for one worst-case turn (camera frame + audio + response)
+# before the KV cache fills — past the limit turns silently come back empty.
+CONTEXT_HEADROOM = 800
+
 engine = None
 tts_backend = None
+context_limit = 32768
 
 
 def _audio_backend():
@@ -123,16 +128,21 @@ def _audio_backend():
 
 
 def load_models():
-    global engine, tts_backend
+    global engine, tts_backend, context_limit
     print(f"Loading Gemma 4 E2B from {MODEL_PATH}...")
+    # KV-cache size. The runtime default (4096) silently kills the
+    # conversation after ~9 camera exchanges: turns come back empty with no
+    # error. 32768 costs ~0.5 GB extra RAM and nothing measurable in latency.
+    context_limit = int(os.environ.get("MAX_NUM_TOKENS", "32768"))
     engine = litert_lm.Engine(
         MODEL_PATH,
         backend=litert_lm.Backend.GPU(),
         vision_backend=litert_lm.Backend.GPU(),
         audio_backend=_audio_backend(),
+        max_num_tokens=context_limit,
     )
     engine.__enter__()
-    print("Engine loaded.")
+    print(f"Engine loaded (max_num_tokens={context_limit}).")
 
     tts_backend = tts.load()
 
@@ -408,14 +418,19 @@ def build_content(msg: dict, frame_prefilled: bool = False) -> list:
     return content
 
 
+def fresh_conversation():
+    c = engine.create_conversation(
+        messages=[{"role": "system", "content": SYSTEM_PROMPT}],
+    )
+    c.__enter__()
+    return c
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
 
-    conversation = engine.create_conversation(
-        messages=[{"role": "system", "content": SYSTEM_PROMPT}],
-    )
-    conversation.__enter__()
+    conversation = fresh_conversation()
 
     interrupted = asyncio.Event()
     msg_queue = asyncio.Queue()
@@ -448,6 +463,18 @@ async def websocket_endpoint(ws: WebSocket):
             msg = await msg_queue.get()
             if msg is None:
                 break
+            # Rotate the conversation before the KV cache fills — losing old
+            # history beats the silent empty-turn failure at the limit.
+            try:
+                tokens = conversation.token_count
+            except RuntimeError:
+                tokens = 0
+            if tokens > context_limit - CONTEXT_HEADROOM:
+                print(f"Context near limit ({tokens}/{context_limit} tokens) — fresh conversation")
+                conversation.__exit__(None, None, None)
+                conversation = fresh_conversation()
+                frame_prefilled = False
+
             if msg.get("type") == "frame":
                 # Always accept a fresh frame (the client sends at most one
                 # per utterance; a re-send replaces a stale one).
