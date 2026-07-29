@@ -937,12 +937,24 @@ function stopPlayback() {
   streamNextTime = 0;
 }
 
+let ttsSink = null;    // MediaStreamDestination the TTS plays into
+let ttsAudioEl = null; // hidden <audio> element that actually outputs it
+
 function ensureAudioCtx() {
   if (!audioCtx) {
     audioCtx = new AudioContext();
     analyser = audioCtx.createAnalyser();
     analyser.fftSize = 256;
     analyser.smoothingTimeConstant = 0.75;
+    // Route TTS through a media element instead of audioCtx.destination:
+    // Chrome's echo canceller only uses element/WebRTC playback as its
+    // reference signal, so raw WebAudio output would be picked up by the
+    // mic as "user speech" despite echoCancellation: true (crbug 687574).
+    ttsSink = audioCtx.createMediaStreamDestination();
+    ttsAudioEl = document.createElement('audio');
+    ttsAudioEl.srcObject = ttsSink.stream;
+    ttsAudioEl.autoplay = true;
+    document.body.appendChild(ttsAudioEl);
   }
 }
 
@@ -972,7 +984,7 @@ function queueAudioChunk(base64Pcm) {
 
   const source = audioCtx.createBufferSource();
   source.buffer = audioBuffer;
-  source.connect(audioCtx.destination);
+  source.connect(ttsSink);
   source.connect(analyser);
 
   // Schedule gapless playback
@@ -1051,6 +1063,7 @@ async function init() {
   const initAudio = () => {
     ensureAudioCtx();
     if (audioCtx.state === 'suspended') audioCtx.resume();
+    if (ttsAudioEl) ttsAudioEl.play().catch(() => {});
     document.removeEventListener('click', initAudio);
     document.removeEventListener('keydown', initAudio);
   };
