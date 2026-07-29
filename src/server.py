@@ -11,16 +11,21 @@ so the final request only pays for the tail of the utterance.
 import asyncio
 import base64
 import http.client
+import io
 import json
 import os
 import re
 import shutil
 import socket
 import subprocess
+import sys
 import time
 import traceback
+import wave
 from contextlib import asynccontextmanager
 from pathlib import Path
+
+sys.stdout.reconfigure(line_buffering=True)  # logs stream even when piped
 
 import numpy as np
 import uvicorn
@@ -92,12 +97,13 @@ NUDGE_PROMPT = (
     "in one short, warm sentence encourage them to continue. No transcript line.)"
 )
 
-# TURN_MODE=two_phase splits each audio turn into two requests: a tiny
-# decision request (audio + "did they finish?"), then, only when FINISHED, a
-# streaming response request with the same audio in the same turn but a clean
-# instruction. The prefix cache shares the audio between the two, and neither
-# request pollutes the stored history.
-TURN_MODE = os.environ.get("TURN_MODE", "marker")  # marker | two_phase
+# How turn completeness ("did the user finish their thought?") is judged:
+#   smart     — the smart-turn-v3 audio classifier decides in ~30ms and the
+#               LLM never sees marker instructions at all (default; E2B judged
+#               too unreliably at this in live testing)
+#   marker    — the LLM starts every reply with FINISHED/WAIT
+#   two_phase — a separate tiny LLM decision request, then a clean response
+TURN_MODE = os.environ.get("TURN_MODE", "smart")  # smart | marker | two_phase
 
 SYSTEM_PROMPT_TWO_PHASE = (
     "You are a friendly, conversational AI assistant. The user talks to you "
@@ -150,6 +156,7 @@ _DONE = object()
 
 llama_proc = None
 tts_backend = None
+detector = None  # smart-turn classifier (TURN_MODE=smart)
 
 
 def resolve_model_paths() -> tuple[str, str]:
@@ -212,8 +219,11 @@ def start_llama_server():
 
 
 def load_models():
-    global tts_backend
+    global tts_backend, detector
     start_llama_server()
+    if TURN_MODE == "smart":
+        from turn_detector import TurnDetector
+        detector = TurnDetector()
     tts_backend = tts.load()
 
 
@@ -599,18 +609,18 @@ async def prime_cache(messages: list):
         return False
 
 
-def user_content(msg: dict, frame_image: str | None, chunks: list[str]) -> list:
+def user_content(image_b64: str | None, audio_b64s: list[str]) -> list:
     """Media parts of the current user turn, in canonical (cache-stable)
-    order: image, speech chunks, final audio."""
-    parts = []
-    image = msg.get("image") or frame_image
-    if image:
-        parts.append(image_part(image))
-    for c in chunks:
-        parts.append(audio_part(c))
-    if valid_audio(msg.get("audio")):
-        parts.append(audio_part(msg["audio"]))
+    order: image first, then audio segments oldest-to-newest."""
+    parts = [image_part(image_b64)] if image_b64 else []
+    parts += [audio_part(b) for b in audio_b64s]
     return parts
+
+
+def wav_to_float32(b64: str) -> np.ndarray:
+    with wave.open(io.BytesIO(base64.b64decode(b64)), "rb") as w:
+        pcm = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
+    return pcm.astype(np.float32) / 32768.0
 
 
 def marker_instruction(msg: dict, has_image: bool, has_audio: bool) -> str:
@@ -662,6 +672,7 @@ async def websocket_endpoint(ws: WebSocket):
 
     frame_image: str | None = None   # camera frame held for the current utterance
     speech_chunks: list[str] = []    # streamed-in speech, already cache-primed
+    held_audio: list[str] = []       # incomplete-turn segments awaiting continuation
 
     try:
         while True:
@@ -681,7 +692,7 @@ async def websocket_endpoint(ws: WebSocket):
                     frame_image = msg["image"]
                     speech_chunks = []
                     await prime_cache(history + [
-                        {"role": "user", "content": user_content({}, frame_image, [])}])
+                        {"role": "user", "content": user_content(frame_image, held_audio)}])
                 continue
 
             if msg.get("type") == "speech_chunk":
@@ -690,24 +701,50 @@ async def websocket_endpoint(ws: WebSocket):
                 if valid_audio(msg.get("audio")):
                     speech_chunks.append(msg["audio"])
                     await prime_cache(history + [
-                        {"role": "user", "content": user_content({}, frame_image, speech_chunks)}])
+                        {"role": "user",
+                         "content": user_content(frame_image, held_audio + speech_chunks)}])
                 continue
 
             interrupted.clear()
             chunks = speech_chunks if msg.get("chunked") else []
-            content = user_content(msg, frame_image, chunks)
-            has_image = any(p["type"] == "image_url" for p in content)
-            has_audio = any(p["type"] == "input_audio" for p in content)
-            frame_image = None
             speech_chunks = []
+            audio_b64s = held_audio + chunks
+            if valid_audio(msg.get("audio")):
+                audio_b64s.append(msg["audio"])
+            image = msg.get("image") or frame_image
+            has_audio = bool(audio_b64s)
 
-            if not content and not msg.get("text") and msg.get("type") != "nudge":
+            if not audio_b64s and not image and not msg.get("text") and msg.get("type") != "nudge":
                 # Mic glitch produced no usable media — release the client.
                 await ws.send_text(json.dumps({
                     "type": "turn_final", "transcription": None,
                     "timings": {}, "spoke": False,
                 }))
                 continue
+
+            # Smart mode: the audio classifier judges completeness before the
+            # LLM is involved at all. Incomplete → hold the segments (they stay
+            # in the next turn's content AND warm in the cache) and wait.
+            if TURN_MODE == "smart" and has_audio and msg.get("type") != "nudge":
+                pcm = np.concatenate([wav_to_float32(b) for b in audio_b64s])
+                t0d = time.time()
+                complete, prob = await asyncio.get_event_loop().run_in_executor(
+                    None, detector.predict, pcm)
+                decision_s = round(time.time() - t0d, 3)
+                if not complete and not interrupted.is_set():
+                    held_audio = audio_b64s
+                    await prime_cache(history + [
+                        {"role": "user", "content": user_content(frame_image, held_audio)}])
+                    await ws.send_text(json.dumps({
+                        "type": "turn_incomplete", "kind": "short",
+                        "decision_s": decision_s, "p_complete": round(prob, 2),
+                    }))
+                    continue
+
+            content = user_content(image, audio_b64s)
+            has_image = bool(image)
+            frame_image = None
+            held_audio = []
 
             try:
                 if TURN_MODE == "two_phase" and has_audio:
@@ -738,8 +775,13 @@ async def websocket_endpoint(ws: WebSocket):
                                               expect_marker=False,
                                               extra_timings={"decision_s": decision_s})
                 else:
-                    user_msg = {"role": "user",
-                                "content": content + [text_part(marker_instruction(msg, has_image, has_audio))]}
+                    if TURN_MODE == "smart" and has_audio and msg.get("type") != "nudge":
+                        camera = (" Mention what you see on their camera if relevant."
+                                  if has_image else "")
+                        instruction = RESPOND_PROMPT.format(camera=camera)
+                    else:
+                        instruction = marker_instruction(msg, has_image, has_audio)
+                    user_msg = {"role": "user", "content": content + [text_part(instruction)]}
                     raw_text = await run_turn(ws, history + [user_msg], interrupted, active,
                                               expect_marker=(TURN_MODE == "marker"))
                 # Store the turn verbatim (same bytes → full prefix-cache hit
