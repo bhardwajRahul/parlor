@@ -127,6 +127,14 @@ def _audio_backend():
     return litert_lm.Backend.CPU(thread_count=threads or None)
 
 
+def _vision_backend():
+    """VISION_BACKEND=gpu|none — use none for model files without a vision
+    encoder (e.g. the current gemma-4-12B .litertlm)."""
+    if os.environ.get("VISION_BACKEND", "gpu").lower() == "none":
+        return None
+    return litert_lm.Backend.GPU()
+
+
 def load_models():
     global engine, tts_backend, context_limit
     print(f"Loading Gemma 4 E2B from {MODEL_PATH}...")
@@ -137,7 +145,7 @@ def load_models():
     engine = litert_lm.Engine(
         MODEL_PATH,
         backend=litert_lm.Backend.GPU(),
-        vision_backend=litert_lm.Backend.GPU(),
+        vision_backend=_vision_backend(),
         audio_backend=_audio_backend(),
         max_num_tokens=context_limit,
     )
