@@ -793,13 +793,23 @@ let uttSamplesSent = 0;
 let chunkSeq = 0;
 let speechActive = false;
 
-function handleVadFrame(frame) {
-  if (speechActive) {
+let bargeFrames = 0; // consecutive high-probability speech frames while TTS plays
+
+function handleVadFrame(probs, frame) {
+  // Barge-in needs ~250ms of SUSTAINED speech, not a single loud frame —
+  // otherwise the mic catching our own TTS interrupts the reply (echo).
+  if (state === 'speaking') {
+    bargeFrames = (probs && probs.isSpeech > 0.92) ? bargeFrames + 1 : 0;
+    if (bargeFrames >= 8) { bargeFrames = 0; triggerBargeIn(); }
+    return;
+  }
+  bargeFrames = 0;
+  if (speechActive && state === 'listening') {
     uttFrames.push(frame);
     let total = 0;
     for (const f of uttFrames) total += f.length;
     if (total - uttSamplesSent >= CHUNK_SECONDS * 16000) sendSpeechChunk(total);
-  } else {
+  } else if (!speechActive) {
     preFrames.push(frame);
     if (preFrames.length > PRE_FRAMES) preFrames.shift();
   }
@@ -818,6 +828,7 @@ function sendSpeechChunk(totalSamples) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   const all = concatFrames(uttFrames);
   const chunk = all.subarray(uttSamplesSent, totalSamples);
+  if (chunk.length < 4800) return; // <300ms — not worth a priming request
   ws.send(JSON.stringify({ type: 'speech_chunk', seq: chunkSeq++, audio: float32ToWavBase64(chunk) }));
   uttSamplesSent = totalSamples;
 }
@@ -844,25 +855,29 @@ function prefetchFrame() {
 function handleSpeechStart() {
   clearNudgeTimer();
   if (state === 'listening') { prefetchFrame(); startUtteranceCapture(); }
-  if (state === 'speaking') {
-    // Ignore echo: don't allow barge-in right after TTS starts playing
-    if (Date.now() - speakingStartedAt < BARGE_IN_GRACE_MS) {
-      console.log('Barge-in suppressed (echo grace period)');
-      return;
-    }
-    stopPlayback();
-    ignoreIncomingAudio = true;
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'interrupt' }));
-    }
-    setState('listening');
-    prefetchFrame();
-    startUtteranceCapture();
-    console.log('Barge-in: interrupted playback');
+  // Barge-in while speaking is handled frame-by-frame in handleVadFrame,
+  // which requires sustained speech — a single VAD trigger is too often echo.
+}
+
+function triggerBargeIn() {
+  if (Date.now() - speakingStartedAt < BARGE_IN_GRACE_MS) {
+    console.log('Barge-in suppressed (echo grace period)');
+    return;
   }
+  stopPlayback();
+  ignoreIncomingAudio = true;
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'interrupt' }));
+  }
+  setState('listening');
+  prefetchFrame();
+  startUtteranceCapture();
+  console.log('Barge-in: interrupted playback');
 }
 
 function handleSpeechEnd(audio) {
+  const wasStreaming = speechActive && uttSamplesSent > 0;
+  speechActive = false; // always reset — a leak here streams mic audio forever
   if (state !== 'listening') return;
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
@@ -880,15 +895,16 @@ function handleSpeechEnd(audio) {
   currentAssistantEl = null;
   ignoreIncomingAudio = false;
   const payload = {};
-  if (speechActive && uttSamplesSent > 0) {
-    // Chunks already streamed — send only the un-sent tail.
+  if (wasStreaming) {
+    // Chunks already streamed — send only the un-sent tail (may be empty;
+    // the server then responds from the streamed chunks alone).
     const all = concatFrames(uttFrames);
-    payload.audio = float32ToWavBase64(all.subarray(uttSamplesSent));
+    const tail = all.subarray(uttSamplesSent);
+    if (tail.length >= 1600) payload.audio = float32ToWavBase64(tail);
     payload.chunked = true;
   } else {
     payload.audio = float32ToWavBase64(audio);
   }
-  speechActive = false;
   if (imageBase64) payload.image = imageBase64;
   ws.send(JSON.stringify(payload));
 }
@@ -1023,7 +1039,7 @@ async function init() {
       speechActive = false;
       console.log('VAD misfire (too short)');
     },
-    onFrameProcessed: (probs, frame) => handleVadFrame(Float32Array.from(frame)),
+    onFrameProcessed: (probs, frame) => handleVadFrame(probs, Float32Array.from(frame)),
     onnxWASMBasePath: "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/",
     baseAssetPath: "https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/",
   });

@@ -63,6 +63,8 @@ SYSTEM_PROMPT = (
     "response on the next line.\n"
     "- WAIT — the user has not finished: they were cut off mid-sentence or are "
     "pausing to think. Say nothing else and let them continue.\n"
+    "Also reply WAIT if the audio is just an echo of your own previous reply "
+    "(the microphone picking up your voice) or is silence or noise.\n"
     "\n"
     "If the user sent audio, end your reply with a new line:\n"
     "###TRANSCRIPT: the exact words the user said\n"
@@ -275,6 +277,12 @@ class ChatStream:
         self.conn.request("POST", "/v1/chat/completions", json.dumps(self.body),
                           {"Content-Type": "application/json"})
         resp = self.conn.getresponse()
+        if resp.status != 200:
+            # Surface bad requests as errors: a silently-empty turn would get
+            # stored in history and poison every subsequent request.
+            body = resp.read()[:300]
+            self.conn.close()
+            raise RuntimeError(f"llama-server HTTP {resp.status}: {body!r}")
         try:
             while True:
                 line = resp.readline()
@@ -323,6 +331,12 @@ def image_part(b64: str) -> dict:
 
 def audio_part(b64: str) -> dict:
     return {"type": "input_audio", "input_audio": {"data": b64, "format": "wav"}}
+
+
+def valid_audio(b64: str | None) -> bool:
+    """At least ~100ms of 16kHz s16 WAV — llama-server 400s on empty audio,
+    and one bad message in history would poison every later request."""
+    return bool(b64) and len(b64) * 3 // 4 > 44 + 3200
 
 
 def text_part(text: str) -> dict:
@@ -594,15 +608,15 @@ def user_content(msg: dict, frame_image: str | None, chunks: list[str]) -> list:
         parts.append(image_part(image))
     for c in chunks:
         parts.append(audio_part(c))
-    if msg.get("audio"):
+    if valid_audio(msg.get("audio")):
         parts.append(audio_part(msg["audio"]))
     return parts
 
 
-def marker_instruction(msg: dict, has_image: bool) -> str:
+def marker_instruction(msg: dict, has_image: bool, has_audio: bool) -> str:
     if msg.get("type") == "nudge":
         return NUDGE_PROMPT if TURN_MODE == "marker" else NUDGE_PROMPT_TWO_PHASE
-    if msg.get("audio"):
+    if has_audio:
         base = ("The user just spoke while showing their camera. Start with FINISHED or WAIT, "
                 "then respond to what they said, referencing what you see if relevant."
                 if has_image else
@@ -673,7 +687,7 @@ async def websocket_endpoint(ws: WebSocket):
             if msg.get("type") == "speech_chunk":
                 if msg.get("seq") == 0:
                     speech_chunks = []
-                if msg.get("audio"):
+                if valid_audio(msg.get("audio")):
                     speech_chunks.append(msg["audio"])
                     await prime_cache(history + [
                         {"role": "user", "content": user_content({}, frame_image, speech_chunks)}])
@@ -683,11 +697,20 @@ async def websocket_endpoint(ws: WebSocket):
             chunks = speech_chunks if msg.get("chunked") else []
             content = user_content(msg, frame_image, chunks)
             has_image = any(p["type"] == "image_url" for p in content)
+            has_audio = any(p["type"] == "input_audio" for p in content)
             frame_image = None
             speech_chunks = []
 
+            if not content and not msg.get("text") and msg.get("type") != "nudge":
+                # Mic glitch produced no usable media — release the client.
+                await ws.send_text(json.dumps({
+                    "type": "turn_final", "transcription": None,
+                    "timings": {}, "spoke": False,
+                }))
+                continue
+
             try:
-                if TURN_MODE == "two_phase" and msg.get("audio"):
+                if TURN_MODE == "two_phase" and has_audio:
                     decision_messages = history + [
                         {"role": "user", "content": content + [text_part(DECISION_PROMPT)]}]
                     t0 = time.time()
@@ -716,13 +739,15 @@ async def websocket_endpoint(ws: WebSocket):
                                               extra_timings={"decision_s": decision_s})
                 else:
                     user_msg = {"role": "user",
-                                "content": content + [text_part(marker_instruction(msg, has_image))]}
+                                "content": content + [text_part(marker_instruction(msg, has_image, has_audio))]}
                     raw_text = await run_turn(ws, history + [user_msg], interrupted, active,
                                               expect_marker=(TURN_MODE == "marker"))
                 # Store the turn verbatim (same bytes → full prefix-cache hit
-                # on the next request).
-                history.append(user_msg)
-                history.append({"role": "assistant", "content": raw_text or "..."})
+                # on the next request). Never store a turn the model produced
+                # nothing for — a degenerate message poisons all later requests.
+                if raw_text.strip():
+                    history.append(user_msg)
+                    history.append({"role": "assistant", "content": raw_text})
             except DISCONNECT_ERRORS:
                 raise
             except Exception:
