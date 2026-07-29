@@ -24,7 +24,7 @@ Browser (mic + camera)
     │  WebSocket (audio PCM + JPEG frames)
     ▼
 FastAPI server
-    ├── Gemma 4 E2B via LiteRT-LM (GPU)  →  understands speech + vision
+    ├── Gemma 4 E2B via llama.cpp (QAT q4_0)  →  understands speech + vision
     └── Kokoro TTS (MLX on Mac, ONNX on Linux)  →  speaks back
     │
     │  WebSocket (streamed audio chunks)
@@ -35,14 +35,15 @@ Browser (playback + transcript)
 - **Voice Activity Detection** in the browser ([Silero VAD](https://github.com/ricky0123/vad)). Hands-free, no push-to-talk, with a short 200ms silence cutoff for fast turn-taking.
 - **Turn-completeness filtering.** Gemma judges every utterance (`FINISHED` / `WAIT`) before answering — if you were cut off mid-sentence or paused to think, it stays quiet and lets you continue, then gently nudges you if you go silent. (Same idea as [Pipecat's incomplete-turn filtering](https://docs.pipecat.ai/api-reference/server/utilities/turn-management/filter-incomplete-turns).)
 - **Streaming decode → TTS.** The response is spoken sentence-by-sentence while the model is still generating, and the transcript is generated last so it never delays audio.
-- **Speculative frame prefill.** The camera frame is sent the moment you start speaking, so Gemma digests the image (~274 tokens) while you're still talking — vision costs almost nothing by the time you finish.
-- **Barge-in.** Interrupt the AI mid-sentence by speaking; generation is cancelled server-side.
+- **Speculative prefill during speech.** The camera frame is sent the moment you start speaking, and your speech itself streams to the server in ~3s chunks — both are pushed through llama.cpp's prompt cache while you're still talking, so at the end of a long question almost everything is already processed.
+- **Barge-in.** Interrupt the AI mid-sentence by speaking; generation is aborted server-side.
 
 ## Requirements
 
 - Python 3.12+
+- [llama.cpp](https://github.com/ggml-org/llama.cpp) (`brew install llama.cpp` on macOS)
 - macOS with Apple Silicon, or Linux with a supported GPU
-- ~3 GB free RAM for the model
+- ~4 GB free RAM for the model
 
 ## Quick start
 
@@ -50,8 +51,9 @@ Browser (playback + transcript)
 git clone https://github.com/fikrikarim/parlor.git
 cd parlor
 
-# Install uv if you don't have it
+# Install uv and llama.cpp if you don't have them
 curl -LsSf https://astral.sh/uv/install.sh | sh
+brew install llama.cpp
 
 cd src
 uv sync
@@ -60,28 +62,30 @@ uv run server.py
 
 Open [http://localhost:8000](http://localhost:8000), grant camera and microphone access, and start talking.
 
-Models are downloaded automatically on first run (~2.6 GB for Gemma 4 E2B, plus TTS models).
+Models are downloaded automatically on first run (~4 GB for Gemma 4 E2B QAT + its multimodal projector, plus TTS models).
 
 ## Configuration
 
-| Variable         | Default                        | Description                                    |
-| ---------------- | ------------------------------ | ---------------------------------------------- |
-| `MODEL_PATH`     | auto-download from HuggingFace | Path to a local `gemma-4-E2B-it.litertlm` file |
-| `PORT`           | `8000`                         | Server port                                    |
-| `MAX_NUM_TOKENS` | `32768`                        | KV-cache size (context window). Lower it to save ~0.5 GB RAM. The server starts a fresh conversation shortly before the cache fills |
-| `AUDIO_BACKEND`  | `cpu`                          | Audio encoder backend (the current model file only supports `cpu`) |
-| `AUDIO_THREADS`  | library default                | CPU threads for the audio encoder              |
+| Variable           | Default                        | Description                                    |
+| ------------------ | ------------------------------ | ---------------------------------------------- |
+| `MODEL_PATH`       | auto-download from HuggingFace | Path to a local Gemma 4 `.gguf` file           |
+| `MMPROJ_PATH`      | auto-download from HuggingFace | Path to the matching `mmproj` `.gguf` (audio + vision encoders) |
+| `PORT`             | `8000`                         | Server port                                    |
+| `LLAMA_CTX`        | `16384`                        | llama.cpp context size. The server drops the oldest exchanges shortly before it fills |
+| `LLAMA_PORT`       | `8081`                         | Port for the spawned llama-server              |
+| `LLAMA_SERVER_URL` | (spawn our own)                | Use an already-running llama-server instead    |
+| `TURN_MODE`        | `marker`                       | `two_phase` splits each turn into a decision request + a clean response request |
 
 ## Performance (Apple M3 Pro)
 
-Measured from end of utterance to first audio heard (add ~200ms of VAD silence detection on top). The camera frame is prefilled while you're still speaking, so vision adds almost nothing to the critical path:
+Measured from end of utterance to first audio heard (add ~200ms of VAD silence detection on top). The camera frame and the speech itself are prefilled while you're still speaking, so long questions and vision add very little to the critical path:
 
-| Turn                             | First audio | Turn complete |
-| -------------------------------- | ----------- | ------------- |
-| Short question (~2s speech)      | ~0.9s       | ~1.2s         |
-| Short question + camera          | ~0.6s       | ~0.9s         |
-| Long question (~9s speech)       | ~1.1s       | ~2.2s         |
-| Long question + camera           | ~1.1s       | ~2.2s         |
+| Turn                                  | First audio | Turn complete |
+| ------------------------------------- | ----------- | ------------- |
+| Short question (~2s speech)           | ~0.6-0.7s   | ~0.7s         |
+| Short question + camera               | ~0.7-0.8s   | ~0.8s         |
+| Long question (~9s speech), streamed  | ~0.6-0.7s   | ~1.7-1.8s     |
+| Long question + camera                | ~0.8-1.0s   | ~1.9-2.1s     |
 
 Reproduce with the end-to-end benchmark (real spoken audio, synthesized locally). Run it before and after a change to see the impact:
 
