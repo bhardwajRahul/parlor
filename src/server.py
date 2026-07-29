@@ -85,6 +85,14 @@ NUDGE_PROMPT = (
     "in one short, warm sentence encourage them to continue. No transcript line.)"
 )
 
+# Sent as a tiny standalone turn the moment the user STARTS speaking, so the
+# ~274 image tokens are already in the KV cache when the audio arrives —
+# cuts camera-turn time-to-first-token by ~75%.
+FRAME_PROMPT = (
+    "This is the user's current camera view; they are about to speak. "
+    "Reply with only the word OK."
+)
+
 # Accept close marker variants ("FINISH", trailing colon, markdown wrap) —
 # they never appear as the first word of a real response in uppercase.
 MARKER_RE = re.compile(r"[\s*_]*(FINISHED|FINISH|WAITING|WAIT)\b[:.]?[\s*_]*")
@@ -230,6 +238,29 @@ class StreamParser:
         return sentences + ([tail] if tail else []), transcript
 
 
+async def run_frame_turn(conversation, image_b64: str):
+    """Prefill the camera frame while the user is still speaking."""
+    t0 = time.time()
+
+    def produce():
+        for _ in conversation.send_message_async(
+            {"role": "user", "content": [
+                {"type": "image", "blob": image_b64},
+                {"type": "text", "text": FRAME_PROMPT},
+            ]},
+            max_output_tokens=4,
+        ):
+            pass
+
+    try:
+        await asyncio.get_event_loop().run_in_executor(None, produce)
+        print(f"Frame prefilled ({time.time() - t0:.2f}s)")
+        return True
+    except Exception as e:
+        print(f"Frame prefill failed: {e}")
+        return False
+
+
 async def run_turn(ws: WebSocket, conversation, content: list, interrupted: asyncio.Event):
     """Stream one model turn: decode → sentences → TTS, all pipelined."""
     loop = asyncio.get_event_loop()
@@ -357,7 +388,7 @@ async def run_turn(ws: WebSocket, conversation, content: list, interrupted: asyn
         }))
 
 
-def build_content(msg: dict) -> list:
+def build_content(msg: dict, frame_prefilled: bool = False) -> list:
     content = []
     if msg.get("audio"):
         content.append({"type": "audio", "blob": msg["audio"]})
@@ -366,7 +397,7 @@ def build_content(msg: dict) -> list:
 
     if msg.get("type") == "nudge":
         content.append({"type": "text", "text": NUDGE_PROMPT})
-    elif msg.get("audio") and msg.get("image"):
+    elif msg.get("audio") and (msg.get("image") or frame_prefilled):
         content.append({"type": "text", "text": "The user just spoke while showing their camera. Start with FINISHED or WAIT, then respond to what they said, referencing what you see if relevant. End with the ###TRANSCRIPT line."})
     elif msg.get("audio"):
         content.append({"type": "text", "text": "The user just spoke to you. Start with FINISHED or WAIT, then respond to what they said. End with the ###TRANSCRIPT line."})
@@ -411,14 +442,24 @@ async def websocket_endpoint(ws: WebSocket):
 
     recv_task = asyncio.create_task(receiver())
 
+    frame_prefilled = False
     try:
         while True:
             msg = await msg_queue.get()
             if msg is None:
                 break
+            if msg.get("type") == "frame":
+                # Always accept a fresh frame (the client sends at most one
+                # per utterance; a re-send replaces a stale one).
+                if msg.get("image"):
+                    if await run_frame_turn(conversation, msg["image"]):
+                        frame_prefilled = True
+                    else:
+                        await ws.send_text(json.dumps({"type": "frame_failed"}))
+                continue
             interrupted.clear()
             try:
-                await run_turn(ws, conversation, build_content(msg), interrupted)
+                await run_turn(ws, conversation, build_content(msg, frame_prefilled), interrupted)
             except DISCONNECT_ERRORS:
                 raise
             except Exception:
@@ -429,6 +470,8 @@ async def websocket_endpoint(ws: WebSocket):
                     "type": "turn_final", "transcription": None,
                     "timings": {}, "spoke": False,
                 }))
+            finally:
+                frame_prefilled = False
     except DISCONNECT_ERRORS:
         print("Client disconnected")
     finally:

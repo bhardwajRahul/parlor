@@ -632,6 +632,7 @@ function connect() {
   };
   ws.onclose = () => {
     // A reconnect gets a brand-new server conversation — reset per-turn state.
+    framePrefetched = false;
     clearNudgeTimer();
     setStatus('disconnected', 'Disconnected');
     setTimeout(connect, 2000);
@@ -665,6 +666,8 @@ function connect() {
         setState('listening');
         setStatus('connected', 'Connected');
       }
+    } else if (msg.type === 'frame_failed') {
+      framePrefetched = false; // fall back to attaching the image inline
     } else if (msg.type === 'audio_start') {
       if (ignoreIncomingAudio) return;
       streamSampleRate = msg.sample_rate || 24000;
@@ -776,10 +779,24 @@ function captureFrame() {
 
 // ── VAD Handlers ──
 let speakingStartedAt = 0;
+let framePrefetched = false; // server holds an unconsumed camera frame
 const BARGE_IN_GRACE_MS = 800; // Ignore VAD triggers shortly after TTS starts (echo)
+
+// Send the camera frame the moment speech STARTS: the server prefills the
+// image tokens while the user is still talking, so the audio turn only pays
+// for the audio (~75% faster first token on camera turns).
+function prefetchFrame() {
+  if (framePrefetched || !cameraEnabled) return;
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const image = captureFrame();
+  if (!image) return;
+  ws.send(JSON.stringify({ type: 'frame', image }));
+  framePrefetched = true;
+}
 
 function handleSpeechStart() {
   clearNudgeTimer();
+  if (state === 'listening') prefetchFrame();
   if (state === 'speaking') {
     // Ignore echo: don't allow barge-in right after TTS starts playing
     if (Date.now() - speakingStartedAt < BARGE_IN_GRACE_MS) {
@@ -792,6 +809,7 @@ function handleSpeechStart() {
       ws.send(JSON.stringify({ type: 'interrupt' }));
     }
     setState('listening');
+    prefetchFrame();
     console.log('Barge-in: interrupted playback');
   }
 }
@@ -803,8 +821,10 @@ function handleSpeechEnd(audio) {
   clearNudgeTimer();
   nudgesSent = 0;
   const wavBase64 = float32ToWavBase64(audio);
-  const imageBase64 = captureFrame();
-  const withCamera = !!imageBase64;
+  // Frame already prefetched at speech start; capture now only as fallback.
+  const imageBase64 = framePrefetched ? null : captureFrame();
+  const withCamera = framePrefetched || !!imageBase64;
+  framePrefetched = false;
 
   setState('processing');
   setStatus('processing', 'Processing');
@@ -940,7 +960,12 @@ async function init() {
     preSpeechPadMs: 300,
     onSpeechStart: handleSpeechStart,
     onSpeechEnd: handleSpeechEnd,
-    onVADMisfire: () => { console.log('VAD misfire (too short)'); },
+    onVADMisfire: () => {
+      // No speech-end will follow — let the next real utterance send a
+      // fresh frame instead of pointing the model at this stale one.
+      framePrefetched = false;
+      console.log('VAD misfire (too short)');
+    },
     onnxWASMBasePath: "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/",
     baseAssetPath: "https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/",
   });
