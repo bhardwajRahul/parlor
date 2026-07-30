@@ -49,14 +49,6 @@ def main() -> None:
             ma, mb = metric(a["perf"][name], key), metric(b["perf"][name], key)
             print(f"{name:<20} {fmt(ma):>7} {fmt(mb):>7}  {delta(ma, mb)}")
 
-    print("\n== correctness ==")
-    names = sorted(set(a.get("correctness", {})) | set(b.get("correctness", {})))
-    label = lambda v: "PASS" if v else ("n/a" if v is None else "FAIL")
-    print(f"{'check':<24} {'A':>5} {'B':>5}")
-    for name in names:
-        va, vb = a.get("correctness", {}).get(name), b.get("correctness", {}).get(name)
-        print(f"{name:<24} {label(va):>5} {label(vb):>5}")
-
 
 if __name__ == "__main__":
     main()

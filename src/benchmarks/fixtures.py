@@ -51,6 +51,32 @@ FIXTURES = {
         ["see"],
         "complete",
     ),
+    # Continues incomplete_cutoff: held audio + this = the full question.
+    "continuation": (
+        "the weather in Paris for my trip next week.",
+        ["paris"],
+        "complete",
+    ),
+    "name_intro": (
+        "By the way, my name is Alex. It's nice to meet you!",
+        ["alex"],
+        "complete",
+    ),
+    "name_recall": (
+        "Can you remind me what my name is?",
+        ["name"],
+        "complete",
+    ),
+}
+
+# Degraded re-recordings of base fixtures, reproducing live-mic conditions
+# clean synthesis can't: VAD-clipped word endings (the encoder hallucinates
+# confident completions on abrupt cuts), background noise, other voices.
+# name -> (base fixture, degradation kwargs for _synthesize)
+VARIANTS = {
+    "capital_france_clipped": ("capital_france", {"clip_end_s": 0.18}),
+    "capital_france_noisy": ("capital_france", {"snr_db": 12}),
+    "long_question_male": ("long_question", {"voice": "am_michael"}),
 }
 
 
@@ -73,8 +99,31 @@ def _write_wav(path: Path, pcm: np.ndarray, sr: int) -> None:
         w.writeframes(pcm_int16.tobytes())
 
 
+def _synthesize(backend, text: str, *, voice: str = "af_heart", keep_frac: float | None = None,
+                clip_end_s: float | None = None, snr_db: float | None = None) -> np.ndarray:
+    pcm = backend.generate(text, voice=voice, speed=1.0)
+    pcm = _resample_linear(np.asarray(pcm, dtype=np.float32), backend.sample_rate, TARGET_SR)
+    if keep_frac:  # chop mid-utterance, like an interrupted speaker
+        pcm = pcm[: int(len(pcm) * keep_frac)]
+        fade = min(len(pcm), int(0.01 * TARGET_SR))
+        pcm[-fade:] *= np.linspace(1.0, 0.0, fade)
+    if clip_end_s:  # trim trailing silence, then cut into the last word
+        voiced = np.where(np.abs(pcm) > 0.01)[0]
+        if len(voiced):
+            pcm = pcm[: voiced[-1] + 1]
+        pcm = pcm[: -int(clip_end_s * TARGET_SR)]
+    if snr_db is not None:
+        noise = np.random.default_rng(42).standard_normal(len(pcm)).astype(np.float32)
+        noise *= np.sqrt(np.mean(pcm**2) / (np.mean(noise**2) * 10 ** (snr_db / 10)))
+        pcm = np.clip(pcm + noise, -1.0, 1.0)
+    return pcm
+
+
 def generate_all(force: bool = False) -> None:
-    missing = [n for n in FIXTURES if force or not (FIXTURES_DIR / f"{n}.wav").exists()]
+    specs = {n: (FIXTURES[n][0], {"keep_frac": 0.55} if n == "incomplete_cutoff" else {})
+             for n in FIXTURES}
+    specs |= {n: (FIXTURES[base][0], kwargs) for n, (base, kwargs) in VARIANTS.items()}
+    missing = [n for n in specs if force or not (FIXTURES_DIR / f"{n}.wav").exists()]
     if not missing:
         return
     FIXTURES_DIR.mkdir(exist_ok=True)
@@ -83,13 +132,8 @@ def generate_all(force: bool = False) -> None:
 
     backend = tts.load()
     for name in missing:
-        text = FIXTURES[name][0]
-        pcm = backend.generate(text, speed=1.0)
-        pcm = _resample_linear(np.asarray(pcm, dtype=np.float32), backend.sample_rate, TARGET_SR)
-        if name == "incomplete_cutoff":
-            pcm = pcm[: int(len(pcm) * 0.55)]  # chop mid-utterance
-            fade = min(len(pcm), int(0.01 * TARGET_SR))
-            pcm[-fade:] *= np.linspace(1.0, 0.0, fade)
+        text, kwargs = specs[name]
+        pcm = _synthesize(backend, text, **kwargs)
         _write_wav(FIXTURES_DIR / f"{name}.wav", pcm, TARGET_SR)
         print(f"fixture {name}: {len(pcm) / TARGET_SR:.1f}s speech")
 
@@ -117,15 +161,23 @@ def load_wav_chunks_b64(name: str, chunk_s: float = 3.0) -> list[str]:
     return chunks
 
 
-def make_image_b64(width: int = 320, height: int = 240) -> str:
-    """A scene the model can plausibly describe: blue sky over a green field
-    with a red circle (sun-like) — drawn with PIL, JPEG-encoded like the frontend."""
+def make_image_b64(width: int = 320, height: int = 240, scene: str = "day") -> str:
+    """A scene the model can plausibly describe, drawn with PIL and
+    JPEG-encoded like the frontend. "day": blue sky over a green field with a
+    red sun-like circle. "night": dark sky with a white crescent moon —
+    distinct enough to test frame freshness across turns."""
     from PIL import Image, ImageDraw
 
-    img = Image.new("RGB", (width, height), color=(90, 160, 220))
-    draw = ImageDraw.Draw(img)
-    draw.rectangle([0, height * 2 // 3, width, height], fill=(70, 150, 70))
-    draw.ellipse([width - 110, 20, width - 40, 90], fill=(220, 60, 50))
+    if scene == "night":
+        img = Image.new("RGB", (width, height), color=(12, 14, 40))
+        draw = ImageDraw.Draw(img)
+        draw.ellipse([width - 120, 25, width - 45, 100], fill=(240, 240, 220))
+        draw.ellipse([width - 105, 20, width - 30, 95], fill=(12, 14, 40))  # crescent bite
+    else:
+        img = Image.new("RGB", (width, height), color=(90, 160, 220))
+        draw = ImageDraw.Draw(img)
+        draw.rectangle([0, height * 2 // 3, width, height], fill=(70, 150, 70))
+        draw.ellipse([width - 110, 20, width - 40, 90], fill=(220, 60, 50))
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=70)
     return base64.b64encode(buf.getvalue()).decode()
@@ -133,4 +185,4 @@ def make_image_b64(width: int = 320, height: int = 240) -> str:
 
 if __name__ == "__main__":
     generate_all(force="--force" in sys.argv)
-    print("Fixtures ready:", ", ".join(FIXTURES))
+    print("Fixtures ready:", ", ".join([*FIXTURES, *VARIANTS]))

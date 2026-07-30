@@ -1,4 +1,4 @@
-"""End-to-end benchmark — connects to the running server over WebSocket.
+"""End-to-end latency benchmark — connects to the running server over WebSocket.
 
 Start the server first:  uv run python server.py
 Then run:                uv run python benchmarks/bench.py --label baseline --out results/baseline.json
@@ -10,6 +10,7 @@ config). Compare two runs with:  uv run python benchmarks/compare.py A.json B.js
 
 Works against both the legacy protocol (single "text" message) and the
 streaming protocol ("text_delta" / "turn_incomplete" / "turn_final").
+Correctness and quality live in the e2e test suite:  uv run pytest
 """
 
 import argparse
@@ -181,54 +182,6 @@ async def run_perf_suite(url: str) -> dict:
     return results
 
 
-async def run_correctness_suite(url: str) -> dict:
-    checks = {}
-    async with connect(url) as ws:
-        r = await run_turn(ws, build_payload("capital_france", False, None), timeout=90)
-        transcript = (r["transcription"] or "").lower()
-        checks["transcript_keywords"] = all(k in transcript for k in fixtures.FIXTURES["capital_france"][1])
-        checks["response_nonempty"] = len(r["text"].strip()) > 0
-        checks["audio_received"] = r["audio_chunks"] > 0
-
-        r = await run_turn(ws, build_payload(None, True, "What do you see?"))
-        checks["image_described"] = len(r["text"].strip()) > 10
-
-    # Chunk-streamed speech must keep the transcript intact end to end.
-    async with connect(url) as ws:
-        chunks = fixtures.load_wav_chunks_b64("long_question")
-        for seq, c in enumerate(chunks[:-1]):
-            await ws.send(json.dumps({"type": "speech_chunk", "seq": seq, "audio": c}))
-            await asyncio.sleep(1.0)
-        r = await run_turn(ws, {"audio": chunks[-1], "chunked": True}, timeout=60)
-        transcript = (r["transcription"] or "").lower()
-        checks["overlap_transcript"] = all(
-            k in transcript for k in fixtures.FIXTURES["long_question"][1])
-        print(f"  overlap_transcript: {transcript[:80]!r}")
-
-    # Prefetched-frame grounding: frame sent early, audio asks about the scene.
-    async with connect(url) as ws:
-        await ws.send(json.dumps({"type": "frame", "image": fixtures.make_image_b64()}))
-        await asyncio.sleep(1.2)
-        r = await run_turn(ws, build_payload("describe_scene", False, None), timeout=60)
-        scene_words = ["red", "circle", "sky", "green", "blue", "landscape"]
-        checks["prefetch_grounded"] = any(w in r["text"].lower() for w in scene_words)
-        print(f"  prefetch_grounded: {r['text'][:80]!r}")
-
-    # Incomplete-turn suppression. None = server doesn't support markers (legacy).
-    for name, fixture in [("incomplete_suppressed", "incomplete_cutoff"),
-                          ("thinking_suppressed", "thinking_pause")]:
-        async with connect(url) as ws:
-            r = await run_turn(ws, build_payload(fixture, False, None))
-        if r["marker"] in ("incomplete_short", "incomplete_long"):
-            checks[name] = r["audio_chunks"] == 0
-        elif "prefill_s" not in r["server"]:
-            checks[name] = None  # legacy server: markers not supported
-        else:
-            checks[name] = False  # streaming server responded to an incomplete turn
-        print(f"  {name}: marker={r['marker']} -> {checks[name]}")
-    return checks
-
-
 def git_rev() -> str:
     try:
         return subprocess.run(
@@ -244,27 +197,18 @@ async def main() -> None:
     ap.add_argument("--url", default=SERVER_URL)
     ap.add_argument("--label", default="run")
     ap.add_argument("--out", default=None, help="write results JSON here")
-    ap.add_argument("--skip-correctness", action="store_true")
-    ap.add_argument("--skip-perf", action="store_true")
     args = ap.parse_args()
 
     fixtures.generate_all()
 
-    perf = {}
-    if not args.skip_perf:
-        print(f"== perf suite ({args.label}) ==")
-        perf = await run_perf_suite(args.url)
-    correctness = {}
-    if not args.skip_correctness:
-        print("== correctness suite ==")
-        correctness = await run_correctness_suite(args.url)
+    print(f"== perf suite ({args.label}) ==")
+    perf = await run_perf_suite(args.url)
 
     out = {
         "label": args.label,
         "git_rev": git_rev(),
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         "perf": perf,
-        "correctness": correctness,
     }
     if args.out:
         out_path = Path(args.out)
@@ -277,9 +221,6 @@ async def main() -> None:
         med = median(r["t_total"] for r in entry["runs"])
         fmed = median(r["t_first_audio"] for r in entry["runs"])
         print(f"  {name:<20} first_audio={fmed}s total={med}s")
-    for name, ok in correctness.items():
-        label = "PASS" if ok else ("n/a" if ok is None else "FAIL")
-        print(f"  {name:<24} {label}")
 
 
 if __name__ == "__main__":

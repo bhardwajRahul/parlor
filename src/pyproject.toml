@@ -17,3 +17,10 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "onnxruntime>=1.24.4",
 ]
+
+[dependency-groups]
+dev = ["pytest>=8.4"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
