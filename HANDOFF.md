@@ -108,8 +108,11 @@ Hard-refresh the browser (Cmd+Shift+R) after every server restart.
 
 - [ ] Speakers at normal volume: never answers its own voice (check
       `heard:` lines for its own phrasings).
-- [ ] Speakers loud: same. (Three layers: AEC via the media element, 250ms
-      sustained-speech gate, echo rule in the prompt.)
+- [ ] Speakers loud: same. (Two layers: the 250ms sustained-speech gate
+      and the echo rule in the prompt. Chrome's AEC route is deliberately
+      OFF — on macOS it engages system voice processing that colors the
+      TTS voice per turn and suppresses the user's mic during playback,
+      which killed barge-in. Headphones sidestep echo entirely.)
 - [ ] Deliberate barge-in mid-reply: stops within a beat and handles what
       you said next.
 - [ ] Barge-in within the first ~800ms of it speaking is intentionally
@@ -132,9 +135,8 @@ Hard-refresh the browser (Cmd+Shift+R) after every server restart.
 
 - [ ] **Linux**: llama.cpp installed manually (no brew); TTS falls back to
       kokoro-onnx; `onnxruntime` and vad-web CDN paths. Entirely unverified.
-- [ ] Safari / Firefox: vad-web, the AEC media-element routing, and audio
-      autoplay policies all behave differently. Chrome is the only tested
-      browser.
+- [ ] Safari / Firefox: vad-web and audio autoplay policies behave
+      differently. Chrome is the only tested browser.
 - [ ] Lower-RAM Macs: model + mmproj ≈ 4GB + TTS; 8GB machines are dubious.
 
 ## Known limitations / accepted trade-offs

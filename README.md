@@ -36,7 +36,7 @@ Browser (playback + transcript)
 - **Turn-completeness filtering.** Pipecat's [smart-turn-v3](https://huggingface.co/pipecat-ai/smart-turn-v3) audio classifier (~20ms on CPU) judges whether you finished your thought before the LLM answers — if you were cut off or paused to think, it stays quiet and lets you continue. If you then stay silent, the held audio is flushed to the model, which either answers it or warmly asks you to finish.
 - **Streaming decode → TTS.** The reply opens with a one-line transcript of what you said (committing to it first measurably improves both transcript and response accuracy, and it appears on screen immediately), then the response is spoken sentence-by-sentence while the model is still generating.
 - **Speculative prefill during speech.** The camera frame is sent the moment you start speaking, and your speech itself streams to the server in ~3s chunks — both are pushed through llama.cpp's prompt cache while you're still talking, so at the end of a long question almost everything is already processed.
-- **Barge-in.** Interrupt the AI mid-sentence by speaking; generation is aborted server-side.
+- **Barge-in.** Interrupt the AI mid-sentence by speaking; generation is aborted server-side. Echo is handled without the browser's echo canceller (which muffles both the TTS voice and your barge-in on macOS): a sustained-speech gate plus a prompt rule — or just wear headphones.
 
 ## Requirements
 

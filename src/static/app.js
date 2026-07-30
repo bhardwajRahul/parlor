@@ -487,31 +487,20 @@ function stopPlayback() {
   streamNextTime = 0;
 }
 
-let ttsSink = null;    // MediaStreamDestination the TTS plays into
-let ttsOut = null;     // where TTS sources connect (sink, or raw destination)
-
-// '?raw-audio' bypasses the AEC media-element route: cleaner, consistent
-// output, but the mic will hear the assistant — headphones only. Useful to
-// A/B macOS voice-processing artifacts the AEC path can trigger.
-const RAW_AUDIO = new URLSearchParams(location.search).has('raw-audio');
-let ttsAudioEl = null; // hidden <audio> element that actually outputs it
-
+// TTS plays straight to the WebAudio destination. We tried routing it
+// through a MediaStreamDestination + <audio> element so Chrome's echo
+// canceller would get a reference signal (crbug 687574) — but on macOS
+// that engages system voice processing, which audibly colors the TTS
+// voice per turn AND suppresses the user's mic while playback is active,
+// killing barge-in. Raw output keeps the voice clean and the mic honest;
+// echo defense is the sustained-speech barge-in gate, the post-TTS grace
+// period, and the prompt's echo rule (headphones make it moot).
 function ensureAudioCtx() {
   if (!audioCtx) {
     audioCtx = new AudioContext();
     analyser = audioCtx.createAnalyser();
     analyser.fftSize = 256;
     analyser.smoothingTimeConstant = 0.75;
-    // Route TTS through a media element instead of audioCtx.destination:
-    // Chrome's echo canceller only uses element/WebRTC playback as its
-    // reference signal, so raw WebAudio output would be picked up by the
-    // mic as "user speech" despite echoCancellation: true (crbug 687574).
-    ttsSink = audioCtx.createMediaStreamDestination();
-    ttsOut = RAW_AUDIO ? audioCtx.destination : ttsSink;
-    ttsAudioEl = document.createElement('audio');
-    ttsAudioEl.srcObject = ttsSink.stream;
-    ttsAudioEl.autoplay = true;
-    document.body.appendChild(ttsAudioEl);
   }
 }
 
@@ -540,7 +529,7 @@ function queueAudioChunk(base64Pcm) {
 
   const source = audioCtx.createBufferSource();
   source.buffer = audioBuffer;
-  source.connect(ttsOut);
+  source.connect(audioCtx.destination);
   source.connect(analyser);
 
   // Schedule gapless playback
@@ -612,7 +601,6 @@ async function init() {
   const initAudio = () => {
     ensureAudioCtx();
     if (audioCtx.state === 'suspended') audioCtx.resume();
-    if (ttsAudioEl) ttsAudioEl.play().catch(() => {});
     document.removeEventListener('click', initAudio);
     document.removeEventListener('keydown', initAudio);
   };
