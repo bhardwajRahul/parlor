@@ -73,14 +73,26 @@ RESPOND_PROMPT = (
     "###TRANSCRIPT: followed by the exact words the user said."
 )
 
-NUDGE_PROMPT = (
-    "(The user went quiet without finishing their thought. In one short, warm "
-    "sentence, encourage them to continue. No transcript line.)"
+# Sent with a "flush" turn: the classifier judged the utterance unfinished,
+# the user then stayed silent, so answer what we have — the model decides
+# whether it is answerable or needs encouragement to continue.
+FLUSH_SUFFIX = (
+    " The user paused mid-thought. If their words feel unfinished, reply with "
+    "one short, warm sentence encouraging them to continue instead of answering."
 )
 
 TRANSCRIPT_TAG = "###TRANSCRIPT:"
+# The model takes liberties with the tag ("### TRANSCRIPT: ..."), so parse
+# it tolerantly — a dropped transcript looks like a broken turn to the user.
+TRANSCRIPT_TAG_RE = re.compile(r"#{2,}\s*TRANSCRIPT:?\s*", re.IGNORECASE)
 SENTENCE_END_RE = re.compile(r"[.!?]+\s")
 MAX_OUTPUT_TOKENS = 256
+TEMPERATURE = float(os.environ.get("TEMPERATURE", "0.7"))
+
+# Appended (inside the final WAV) before the LLM sees the utterance: audio
+# that stops abruptly at the VAD cutoff makes the encoder hallucinate a
+# confident completion of the last word; a beat of silence fixes it.
+TAIL_SILENCE_S = 0.3
 
 # Rotate history before the llama context fills. Rough token estimates are
 # fine here — the guard just needs to fire before generation degrades.
@@ -184,7 +196,7 @@ def _chat_body(messages: list, max_tokens: int, stream: bool) -> dict:
     return {
         "messages": messages,
         "max_tokens": max_tokens,
-        "temperature": 0,
+        "temperature": TEMPERATURE,
         "stream": stream,
         "cache_prompt": True,
         "chat_template_kwargs": {"enable_thinking": False},
@@ -317,7 +329,7 @@ class StreamParser:
     """
 
     # Hold back enough of the tail to never TTS a partially-arrived tag.
-    TAG_HOLDBACK = len(TRANSCRIPT_TAG) + 2
+    TAG_HOLDBACK = len(TRANSCRIPT_TAG) + 4
 
     def __init__(self):
         self.response = ""
@@ -331,10 +343,10 @@ class StreamParser:
             return []
 
         self.response += delta
-        tag_pos = self.response.find(TRANSCRIPT_TAG)
-        if tag_pos != -1:
-            self.transcript = self.response[tag_pos + len(TRANSCRIPT_TAG):]
-            self.response = self.response[:tag_pos]
+        m = TRANSCRIPT_TAG_RE.search(self.response)
+        if m:
+            self.transcript = self.response[m.end():]
+            self.response = self.response[:m.start()]
             self._in_transcript = True
         return self._complete_sentences()
 
@@ -519,12 +531,28 @@ def wav_to_float32(b64: str) -> np.ndarray:
     return pcm.astype(np.float32) / 32768.0
 
 
+def pad_tail_silence(b64: str) -> str:
+    """Append TAIL_SILENCE_S of silence inside the WAV. Must be in the same
+    WAV as the speech — a separate silence part doesn't stop the encoder
+    hallucinating a completion of an abruptly-cut last word."""
+    with wave.open(io.BytesIO(base64.b64decode(b64)), "rb") as w:
+        params = w.getparams()
+        frames = w.readframes(w.getnframes())
+    frames += b"\x00" * (2 * int(TAIL_SILENCE_S * params.framerate))
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as out:
+        out.setparams(params)
+        out.writeframes(frames)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
 def turn_instruction(msg: dict, has_image: bool, has_audio: bool) -> str:
-    if msg.get("type") == "nudge":
-        return NUDGE_PROMPT
     if has_audio:
         camera = " Mention what you see on their camera if relevant." if has_image else ""
-        return RESPOND_PROMPT.format(camera=camera)
+        instruction = RESPOND_PROMPT.format(camera=camera)
+        if msg.get("type") == "flush":
+            instruction += FLUSH_SUFFIX
+        return instruction
     if has_image:
         return "The user is showing you their camera. Describe what you see."
     return msg.get("text", "Hello!")
@@ -605,8 +633,9 @@ async def websocket_endpoint(ws: WebSocket):
             image = msg.get("image") or frame_image
             has_audio = bool(audio_b64s)
 
-            if not audio_b64s and not image and not msg.get("text") and msg.get("type") != "nudge":
-                # Mic glitch produced no usable media — release the client.
+            if not audio_b64s and not image and not msg.get("text"):
+                # Mic glitch (or a flush with nothing held) produced no usable
+                # media — release the client.
                 await ws.send_text(json.dumps({
                     "type": "turn_final", "transcription": None,
                     "timings": {}, "spoke": False,
@@ -615,8 +644,10 @@ async def websocket_endpoint(ws: WebSocket):
 
             # The audio classifier judges completeness before the LLM is
             # involved at all. Incomplete → hold the segments (they stay in
-            # the next turn's content AND warm in the cache) and wait.
-            if has_audio and msg.get("type") != "nudge":
+            # the next turn's content AND warm in the cache) and wait. A
+            # flush turn skips the check: the client waited out the hold and
+            # now wants an answer to whatever we have.
+            if has_audio and msg.get("type") != "flush":
                 pcm = np.concatenate([wav_to_float32(b) for b in audio_b64s])
                 t0d = time.time()
                 complete, prob = await asyncio.get_event_loop().run_in_executor(
@@ -627,11 +658,13 @@ async def websocket_endpoint(ws: WebSocket):
                     await prime_cache(history + [
                         {"role": "user", "content": user_content(frame_image, held_audio)}])
                     await ws.send_text(json.dumps({
-                        "type": "turn_incomplete", "kind": "short",
+                        "type": "turn_incomplete",
                         "decision_s": decision_s, "p_complete": round(prob, 2),
                     }))
                     continue
 
+            if audio_b64s:
+                audio_b64s[-1] = pad_tail_silence(audio_b64s[-1])
             content = user_content(image, audio_b64s)
             has_image = bool(image)
             frame_image = None

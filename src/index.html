@@ -633,7 +633,7 @@ function connect() {
   ws.onclose = () => {
     // A reconnect gets a brand-new server conversation — reset per-turn state.
     framePrefetched = false;
-    clearNudgeTimer();
+    clearFlushTimer();
     setStatus('disconnected', 'Disconnected');
     setTimeout(connect, 2000);
   };
@@ -643,12 +643,13 @@ function connect() {
       if (ignoreIncomingAudio) return;
       appendAssistantText(msg.text);
     } else if (msg.type === 'turn_incomplete') {
-      // The model judged the user unfinished — keep listening, nudge later.
+      // The classifier judged the user unfinished — keep listening; if they
+      // stay silent, flush the held audio so the model answers anyway.
       if (ignoreIncomingAudio) { ignoreIncomingAudio = false; return; }
       removeLastUserLoading();
       setState('listening');
       setStatus('connected', 'Connected');
-      startNudgeTimer(msg.kind === 'long' ? 10000 : 5000);
+      startFlushTimer();
     } else if (msg.type === 'turn_final') {
       if (ignoreIncomingAudio) return;
       const userMsgs = messagesDiv.querySelectorAll('.msg.user');
@@ -722,27 +723,28 @@ function removeLastUserLoading() {
   if (last && last.querySelector('.loading-dots')) last.remove();
 }
 
-// ── Nudge timer: re-engage after an incomplete turn goes quiet ──
-let nudgeTimer = null;
-let nudgesSent = 0; // capped per silence stretch, reset when the user speaks
+// ── Flush timer: an incomplete turn went quiet — have the model answer the
+// held audio anyway (it asks the user to continue if the words really are
+// unfinished). Self-limiting: one flush per hold.
+let flushTimer = null;
 
-function startNudgeTimer(delayMs) {
-  clearNudgeTimer();
-  if (nudgesSent >= 2) return; // don't pester an empty room forever
-  nudgeTimer = setTimeout(() => {
-    nudgeTimer = null;
+function startFlushTimer() {
+  clearFlushTimer();
+  flushTimer = setTimeout(() => {
+    flushTimer = null;
     if (state === 'listening' && ws && ws.readyState === WebSocket.OPEN) {
-      nudgesSent++;
       currentAssistantEl = null;
-      ws.send(JSON.stringify({ type: 'nudge' }));
+      ignoreIncomingAudio = false;
+      addMessage('user', '<span class="loading-dots"><span></span><span></span><span></span></span>');
+      ws.send(JSON.stringify({ type: 'flush' }));
       setState('processing');
       setStatus('processing', 'Processing');
     }
-  }, delayMs);
+  }, 2500);
 }
 
-function clearNudgeTimer() {
-  if (nudgeTimer) { clearTimeout(nudgeTimer); nudgeTimer = null; }
+function clearFlushTimer() {
+  if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
 }
 
 function setStatus(cls, text) { statusEl.className = `status-pill ${cls}`; statusEl.textContent = text; }
@@ -853,7 +855,7 @@ function prefetchFrame() {
 }
 
 function handleSpeechStart() {
-  clearNudgeTimer();
+  clearFlushTimer();
   if (state === 'listening') { prefetchFrame(); startUtteranceCapture(); }
   // Barge-in while speaking is handled frame-by-frame in handleVadFrame,
   // which requires sustained speech — a single VAD trigger is too often echo.
@@ -881,8 +883,7 @@ function handleSpeechEnd(audio) {
   if (state !== 'listening') return;
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
-  clearNudgeTimer();
-  nudgesSent = 0;
+  clearFlushTimer();
   // Frame already prefetched at speech start; capture now only as fallback.
   const imageBase64 = framePrefetched ? null : captureFrame();
   const withCamera = framePrefetched || !!imageBase64;
