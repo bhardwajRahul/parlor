@@ -128,7 +128,9 @@ function setState(newState) {
 
   if (newState === 'speaking') requestAnimationFrame(updateSpeakingGlow);
 
-  // Raise VAD threshold during speaking to reduce echo false triggers
+  // Raise the VAD's own segmentation threshold while TTS plays so echo
+  // rarely opens a speech segment. (Barge-in reads raw probabilities in
+  // handleVadFrame — this threshold does not gate it.)
   if (myvad) {
     myvad.setOptions({ positiveSpeechThreshold: newState === 'speaking' ? 0.92 : 0.5 });
   }
@@ -175,7 +177,7 @@ function connect() {
     // A reconnect gets a brand-new server conversation — reset per-turn state.
     framePrefetched = false;
     serverHoldingAudio = false;
-    removeLastUserLoading();
+    removePendingUserBubble();
     clearFlushTimer();
     setStatus('disconnected', 'Disconnected');
     setTimeout(connect, 2000);
@@ -192,8 +194,8 @@ function connect() {
       // Keep the pending bubble: the held audio is still this utterance,
       // and the eventual merged transcript will fill it.
       serverHoldingAudio = true;
-      const held = pendingUserBubble();
-      if (held) setBubbleMeta(held,
+      const bubble = pendingUserBubble();
+      if (bubble) setBubbleMeta(bubble,
         `sounds unfinished (${Math.round((msg.p_complete ?? 0) * 100)}%) — still listening`);
       goListening();
       startFlushTimer();
@@ -205,7 +207,7 @@ function connect() {
     } else if (msg.type === 'turn_final') {
       if (ignoreIncomingAudio) return;
       if (!msg.spoke && !msg.transcription) {
-        removeLastUserLoading();  // glitch/empty turn — nothing was heard
+        removePendingUserBubble();  // glitch/empty turn — nothing was heard
       } else {
         fillUserBubble(msg.transcription);
       }
@@ -268,7 +270,7 @@ function pendingUserBubble() {
   return last && last.querySelector('.loading-dots') ? last : null;
 }
 
-function removeLastUserLoading() {
+function removePendingUserBubble() {
   const bubble = pendingUserBubble();
   if (bubble) bubble.remove();
 }
@@ -276,10 +278,9 @@ function removeLastUserLoading() {
 // One pending bubble per utterance-group: a continuation after a hold (or a
 // flush) belongs to the same bubble the first segment created. The base
 // meta ('with camera') is kept in dataset so later info can extend it.
-function addUserLoadingBubble(meta) {
+function addUserLoadingBubble(meta = '') {
   if (pendingUserBubble()) return;
-  addMessage('user', LOADING_DOTS, meta);
-  messagesDiv.lastElementChild.dataset.base = meta || '';
+  addMessage('user', LOADING_DOTS, meta).dataset.base = meta;
 }
 
 function setBubbleMeta(bubble, extra) {
@@ -323,6 +324,7 @@ function startFlushTimer() {
       currentAssistantEl = null;
       ignoreIncomingAudio = false;
       addUserLoadingBubble();
+      setBubbleMeta(pendingUserBubble(), '');  // hold resolved — drop its meta
       wsSend({ type: 'flush' });
       goProcessing();
     }
@@ -383,18 +385,21 @@ let uttSamplesSent = 0;
 let chunkSeq = 0;
 let speechActive = false;
 
-let bargeWindow = []; // 1/0 per recent frame: speech probability while TTS plays
+// Barge-in gate: BARGE_HITS of the last BARGE_WINDOW frames must read as
+// speech (≈200-320ms of mostly-speech). It must be SUSTAINED, not a single
+// loud frame, or the mic catching our own TTS interrupts the reply (echo) —
+// but real speech dips at every consonant and word boundary, so a
+// consecutive-frames counter never fires on a live mic.
+const BARGE_WINDOW = 10;
+const BARGE_HITS = 6;
+const BARGE_SPEECH_P = 0.85;
+let bargeWindow = []; // 1/0 per recent frame, while TTS plays
 
 function handleVadFrame(probs, frame) {
-  // Barge-in needs SUSTAINED speech, not a single loud frame — otherwise
-  // the mic catching our own TTS interrupts the reply (echo). But real
-  // speech dips at every consonant and word boundary, so a consecutive-
-  // frames counter never fires on a live mic: score a sliding window
-  // (6 of the last 10 frames ≈ 200-320ms of mostly-speech) instead.
   if (state === 'speaking') {
-    bargeWindow.push(probs && probs.isSpeech > 0.85 ? 1 : 0);
-    if (bargeWindow.length > 10) bargeWindow.shift();
-    if (bargeWindow.reduce((a, b) => a + b, 0) >= 6) {
+    bargeWindow.push(probs && probs.isSpeech > BARGE_SPEECH_P ? 1 : 0);
+    if (bargeWindow.length > BARGE_WINDOW) bargeWindow.shift();
+    if (bargeWindow.reduce((a, b) => a + b, 0) >= BARGE_HITS) {
       bargeWindow = [];
       triggerBargeIn();
     }
@@ -402,10 +407,25 @@ function handleVadFrame(probs, frame) {
   }
   bargeWindow = [];
   if (speechActive && state === 'listening') {
+    // Watchdog: barge-in starts capture outside the VAD's own state machine
+    // (startUtteranceCapture in triggerBargeIn). If the VAD never actually
+    // enters speech — an echo burst in the (BARGE_SPEECH_P, 0.92] band can
+    // trip the gate alone — no speech-end will ever arrive, and without
+    // this reset we'd stream silence chunks to the server forever.
+    phantomQuiet = probs && probs.isSpeech < 0.25 ? phantomQuiet + 1 : 0;
+    if (phantomQuiet >= 30) {  // ~1s below the negative threshold
+      phantomQuiet = 0;
+      speechActive = false;
+      uttFrames = [];
+      uttSamplesSent = 0;
+      console.log('phantom capture reset (no speech after barge-in)');
+      return;
+    }
     uttFrames.push(frame);
     const total = totalSamples(uttFrames);
     if (total - uttSamplesSent >= CHUNK_SECONDS * 16000) sendSpeechChunk(total);
   } else if (!speechActive) {
+    phantomQuiet = 0;
     preFrames.push(frame);
     if (preFrames.length > PRE_FRAMES) preFrames.shift();
   }
@@ -432,7 +452,10 @@ function sendSpeechChunk(upTo) {
   uttSamplesSent = upTo;
 }
 
+let phantomQuiet = 0; // capture frames below the negative VAD threshold
+
 function startUtteranceCapture() {
+  phantomQuiet = 0;
   speechActive = true;
   uttFrames = [...preFrames];
   uttSamplesSent = 0;
@@ -485,6 +508,7 @@ function handleSpeechEnd(audio) {
 
   goProcessing();
   addUserLoadingBubble(withCamera ? 'with camera' : '');
+  setBubbleMeta(pendingUserBubble(), '');  // hold resolved — drop its meta
 
   currentAssistantEl = null;
   ignoreIncomingAudio = false;
@@ -595,6 +619,7 @@ function addMessage(role, text, meta) {
   div.innerHTML = `${text}${meta ? `<div class="meta">${meta}</div>` : ''}`;
   messagesDiv.appendChild(div);
   messagesDiv.scrollTop = messagesDiv.scrollHeight;
+  return div;
 }
 
 cameraToggle.addEventListener('click', () => {

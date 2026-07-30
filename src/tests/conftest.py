@@ -53,15 +53,20 @@ def server(tmp_path_factory) -> Server:
 
     # A stale process on either port would make the readiness probe pass
     # against the WRONG server and the whole run would test old code.
+    # fail (not exit): the server-backed tests error out, but the fast
+    # parser unit tests have no server dependency and must keep running.
     for port in (TEST_PORT, TEST_LLAMA_PORT):
         with socket.socket() as s:
             if s.connect_ex(("127.0.0.1", port)) == 0:
-                pytest.exit(f"port {port} is already in use — kill the stale "
-                            f"server (lsof -ti :{port}) and rerun", returncode=3)
+                pytest.fail(f"port {port} is already in use — kill the stale "
+                            f"server (lsof -ti :{port}) and rerun")
 
     log_path = tmp_path_factory.mktemp("server") / "server.log"
+    # MODEL pinned so changing the product default can't silently change
+    # what the suite measures ("e2b" also passes and is ~2x faster if you
+    # are iterating on tests).
     env = {**os.environ, "PORT": str(TEST_PORT), "LLAMA_PORT": str(TEST_LLAMA_PORT),
-           "LLAMA_CTX": "4096"}
+           "LLAMA_CTX": "4096", "MODEL": os.environ.get("MODEL", "e4b")}
     env.pop("LLAMA_SERVER_URL", None)
     with open(log_path, "w") as log:
         proc = subprocess.Popen([sys.executable, "server.py"], cwd=SRC, env=env,

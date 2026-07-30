@@ -346,17 +346,16 @@ async def run_turn(ws, messages: list, interrupted: asyncio.Event,
     return raw["text"]
 
 
-async def prime_cache(messages: list):
+async def prime_cache(messages: list) -> None:
     """Fire-and-discard request that pushes a prompt prefix (camera frame,
     speech chunks) through llama-server's cache while the user is talking.
     Content must be media-only appends — a trailing text block would diverge
-    the prefix and kill reuse."""
+    the prefix and kill reuse. Failure is not worth reporting: the turn still
+    works, it just pays full prefill."""
     t0 = time.time()
     try:
         await asyncio.get_event_loop().run_in_executor(
             None, lambda: llama.chat_blocking(messages, max_tokens=1))
         print(f"Primed cache ({time.time() - t0:.2f}s)")
-        return True
     except Exception as e:
         print(f"Cache priming failed: {e}")
-        return False

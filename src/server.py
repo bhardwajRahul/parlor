@@ -50,7 +50,9 @@ from pipeline import (estimate_tokens, pad_tail_silence, prime_cache,
 SYSTEM_PROMPT = (
     "You are a friendly, conversational AI assistant. The user talks to you "
     "through a microphone and may show you their camera. Your replies are "
-    "spoken aloud, so write plain conversational text without formatting."
+    "spoken aloud, so write plain conversational text without formatting. "
+    "If an audio message is just your own previous reply playing back "
+    "(echo), don't answer it — briefly ask what they'd like to talk about."
 )
 
 # The transcript line LEADS the reply: transcribing after the response
@@ -66,9 +68,12 @@ RESPOND_PROMPT = (
     "to them: 1-4 short sentences, spoken aloud.{camera}"
 )
 
-# Spoken when a flush turn yields no reply at all — silence is the one
-# outcome a flush must never have.
+# Spoken when a turn yields no reply at all (models of every size
+# occasionally emit only the transcript line) — silence would leave the
+# user hanging, and a stored transcript-only reply teaches the model to
+# do it again next turn.
 FLUSH_FALLBACK = "Take your time — I'm listening."
+AUDIO_FALLBACK = "Sorry, I didn't catch that — could you say it again?"
 
 # A "flush" turn: the classifier judged the utterance unfinished, the user
 # then stayed silent, so answer what we have — the model decides whether it
@@ -112,7 +117,8 @@ app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), na
 
 @app.get("/")
 async def root():
-    return HTMLResponse(content=(Path(__file__).parent / "index.html").read_text())
+    html = (Path(__file__).parent / "index.html").read_text()
+    return HTMLResponse(content=html.replace("{{model}}", llama.model_label()))
 
 
 def turn_instruction(msg: dict, has_image: bool, has_audio: bool) -> str:
@@ -201,6 +207,7 @@ async def websocket_endpoint(ws: WebSocket):
                 audio_b64s.append(msg["audio"])
             image = msg.get("image") or frame_image
             has_audio = bool(audio_b64s)
+            is_flush = msg.get("type") == "flush"
 
             if not has_audio and not image and not msg.get("text"):
                 # Mic glitch (or a flush with nothing held) produced no usable media.
@@ -217,7 +224,7 @@ async def websocket_endpoint(ws: WebSocket):
                 # in the next turn's content AND warm in the cache) and wait.
                 # A flush turn skips the check: the client waited out the
                 # hold and now wants an answer to whatever we have.
-                if has_audio and msg.get("type") != "flush":
+                if has_audio and not is_flush:
                     pcm = np.concatenate([wav_to_float32(b) for b in audio_b64s])
                     t0 = time.time()
                     complete, prob = await asyncio.get_event_loop().run_in_executor(
@@ -226,11 +233,15 @@ async def websocket_endpoint(ws: WebSocket):
                     p_complete = round(prob, 2)
                     if not complete and not interrupted.is_set():
                         held_audio = audio_b64s
-                        await prime(held_audio)
+                        # Release the client BEFORE the (slow) cache priming:
+                        # until turn_incomplete arrives it can't capture a
+                        # resumed utterance, and the flush timer's live-speech
+                        # guard can't see the user talking.
                         await send_json(ws, {
                             "type": "turn_incomplete",
                             "decision_s": decision_s, "p_complete": p_complete,
                         })
+                        await prime(held_audio)
                         continue
 
                 # Padding the final segment diverges it from its primed bytes
@@ -244,11 +255,11 @@ async def websocket_endpoint(ws: WebSocket):
 
                 instruction = turn_instruction(msg, bool(image), has_audio)
                 user_msg = {"role": "user", "content": content + [text_part(instruction)]}
-                is_flush = msg.get("type") == "flush"
                 raw_text = await run_turn(ws, history + [user_msg], interrupted, active,
                                           tts_backend, expect_transcript=has_audio,
                                           p_complete=p_complete,
-                                          fallback=FLUSH_FALLBACK if is_flush else None)
+                                          fallback=FLUSH_FALLBACK if is_flush
+                                          else AUDIO_FALLBACK if has_audio else None)
                 # Store the turn verbatim (same bytes → full prefix-cache hit
                 # on the next request). Never store a turn the model produced
                 # nothing for — a degenerate message poisons all later requests.

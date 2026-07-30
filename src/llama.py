@@ -56,6 +56,14 @@ def resolve_model_paths() -> tuple[str, str]:
     return model, mmproj
 
 
+def model_label() -> str:
+    """Human-readable model name for the UI."""
+    path = os.environ.get("MODEL_PATH", "")
+    if path:
+        return Path(path).stem
+    return f"Gemma 4 {MODEL.upper()}" if MODEL in MODELS else MODEL
+
+
 def host_port() -> tuple[str, int]:
     if URL:
         host, _, port = URL.split("//")[-1].partition(":")

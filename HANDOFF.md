@@ -109,11 +109,14 @@ Hard-refresh the browser (Cmd+Shift+R) after every server restart.
 
 - [ ] Speakers at normal volume: never answers its own voice (check
       `heard:` lines for its own phrasings).
-- [ ] Speakers loud: same. (Two layers: the 250ms sustained-speech gate
-      and the echo rule in the prompt. Chrome's AEC route is deliberately
-      OFF — on macOS it engages system voice processing that colors the
-      TTS voice per turn and suppresses the user's mic during playback,
-      which killed barge-in. Headphones sidestep echo entirely.)
+- [ ] Speakers loud: same. (Three layers: the 800ms post-TTS grace
+      period, the sliding-window barge-in gate — BARGE_* constants in
+      static/app.js, tuned for a live mic, needs speaker-volume
+      validation — and the echo rule in the system prompt. Chrome's AEC
+      route is deliberately OFF — on macOS it engages system voice
+      processing that colors the TTS voice per turn and suppresses the
+      user's mic during playback, which killed barge-in. Headphones
+      sidestep echo entirely.)
 - [ ] Deliberate barge-in mid-reply: stops within a beat and handles what
       you said next.
 - [ ] Barge-in within the first ~800ms of it speaking is intentionally
