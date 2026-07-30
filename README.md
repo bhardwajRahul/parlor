@@ -34,7 +34,7 @@ Browser (playback + transcript)
 
 - **Voice Activity Detection** in the browser ([Silero VAD](https://github.com/ricky0123/vad)). Hands-free, no push-to-talk, with a short 200ms silence cutoff for fast turn-taking.
 - **Turn-completeness filtering.** Pipecat's [smart-turn-v3](https://huggingface.co/pipecat-ai/smart-turn-v3) audio classifier (~20ms on CPU) judges whether you finished your thought before the LLM answers — if you were cut off or paused to think, it stays quiet and lets you continue. If you then stay silent, the held audio is flushed to the model, which either answers it or warmly asks you to finish.
-- **Streaming decode → TTS.** The response is spoken sentence-by-sentence while the model is still generating, and the transcript is generated last so it never delays audio.
+- **Streaming decode → TTS.** The reply opens with a one-line transcript of what you said (committing to it first measurably improves both transcript and response accuracy, and it appears on screen immediately), then the response is spoken sentence-by-sentence while the model is still generating.
 - **Speculative prefill during speech.** The camera frame is sent the moment you start speaking, and your speech itself streams to the server in ~3s chunks — both are pushed through llama.cpp's prompt cache while you're still talking, so at the end of a long question almost everything is already processed.
 - **Barge-in.** Interrupt the AI mid-sentence by speaking; generation is aborted server-side.
 
@@ -68,7 +68,8 @@ Models are downloaded automatically on first run (~4 GB for Gemma 4 E2B QAT + it
 
 | Variable           | Default                        | Description                                    |
 | ------------------ | ------------------------------ | ---------------------------------------------- |
-| `MODEL_PATH`       | auto-download from HuggingFace | Path to a local Gemma 4 `.gguf` file           |
+| `MODEL`            | `e2b`                          | Gemma 4 size: `e2b` (fastest), `e4b` (better answers, ~1.8x latency), `12b` (needs ~8GB) |
+| `MODEL_PATH`       | auto-download from HuggingFace | Path to a local Gemma 4 `.gguf` file (overrides `MODEL`) |
 | `MMPROJ_PATH`      | auto-download from HuggingFace | Path to the matching `mmproj` `.gguf` (audio + vision encoders) |
 | `PORT`             | `8000`                         | Server port                                    |
 | `TEMPERATURE`      | `0.7`                          | Sampling temperature (0 = deterministic)       |
@@ -78,14 +79,14 @@ Models are downloaded automatically on first run (~4 GB for Gemma 4 E2B QAT + it
 
 ## Performance (Apple M3 Pro)
 
-Measured from end of utterance to first audio heard (add ~200ms of VAD silence detection on top). The camera frame and the speech itself are prefilled while you're still speaking, so long questions and vision add very little to the critical path:
+Measured from end of utterance to first audio heard (add ~200ms of VAD silence detection on top). The camera frame and the speech itself are prefilled while you're still speaking, and the reply opens with the transcript line (its decode time is included below — the price of accurate transcripts):
 
 | Turn                                  | First audio | Turn complete |
 | ------------------------------------- | ----------- | ------------- |
-| Short question (~2s speech)           | ~0.6-0.7s   | ~0.7s         |
-| Short question + camera               | ~0.7-0.8s   | ~0.8s         |
-| Long question (~9s speech), streamed  | ~0.6-0.7s   | ~1.7-1.8s     |
-| Long question + camera                | ~0.8-1.0s   | ~1.9-2.1s     |
+| Short question (~2s speech)           | ~0.7s       | ~1.3s         |
+| Short question + camera               | ~0.8s       | ~1.3s         |
+| Long question (~9s speech), streamed  | ~1.3-1.4s   | ~2.1-2.3s     |
+| Long question + camera                | ~1.5s       | ~2.3s         |
 
 Reproduce with the end-to-end benchmark (real spoken audio, synthesized locally). Run it before and after a change to see the impact:
 

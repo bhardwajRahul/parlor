@@ -10,10 +10,23 @@ import subprocess
 import time
 from pathlib import Path
 
-# Google's official QAT quant: q4_0 quality trained-in, faster than K-quants.
-HF_GGUF_REPO = "google/gemma-4-E2B-it-qat-q4_0-gguf"
-HF_GGUF_FILE = "gemma-4-E2B_q4_0-it.gguf"
-HF_MMPROJ_FILE = "gemma-4-E2B-it-mmproj.gguf"
+from dotenv import load_dotenv
+
+load_dotenv()  # config below is read at import time — .env must apply first
+
+# Google's official QAT quants: q4_0 quality trained-in, faster than
+# K-quants. MODEL picks the size; MODEL_PATH/MMPROJ_PATH override entirely.
+# Rough guide on an M3 Pro: e2b ≈ 0.6-1.0s to first audio, e4b ≈ 1.0-1.7s
+# (noticeably better answers), 12b needs ~8GB and is slower still.
+MODELS = {
+    "e2b": ("google/gemma-4-E2B-it-qat-q4_0-gguf",
+            "gemma-4-E2B_q4_0-it.gguf", "gemma-4-E2B-it-mmproj.gguf"),
+    "e4b": ("google/gemma-4-E4B-it-qat-q4_0-gguf",
+            "gemma-4-E4B_q4_0-it.gguf", "gemma-4-E4B-it-mmproj.gguf"),
+    "12b": ("google/gemma-4-12B-it-qat-q4_0-gguf",
+            "gemma-4-12b-it-qat-q4_0.gguf", "mmproj-gemma-4-12b-it-qat-q4_0.gguf"),
+}
+MODEL = os.environ.get("MODEL", "e2b").lower()
 
 PORT = int(os.environ.get("LLAMA_PORT", "8081"))
 URL = os.environ.get("LLAMA_SERVER_URL", "")  # set to use an external server
@@ -28,24 +41,29 @@ def resolve_model_paths() -> tuple[str, str]:
     mmproj = os.environ.get("MMPROJ_PATH", "")
     if model and mmproj:
         return model, mmproj
+    if MODEL not in MODELS:
+        raise RuntimeError(f"MODEL={MODEL!r} — expected one of {', '.join(MODELS)}")
+    repo, gguf, mmproj_file = MODELS[MODEL]
     from huggingface_hub import hf_hub_download
-    kw = {}
     try:
-        model = model or hf_hub_download(HF_GGUF_REPO, HF_GGUF_FILE)
-        mmproj = mmproj or hf_hub_download(HF_GGUF_REPO, HF_MMPROJ_FILE)
+        model = model or hf_hub_download(repo, gguf)
+        mmproj = mmproj or hf_hub_download(repo, mmproj_file)
     except Exception:  # offline — use the local cache
         kw = {"local_files_only": True}
-        model = model or hf_hub_download(HF_GGUF_REPO, HF_GGUF_FILE, **kw)
-        mmproj = mmproj or hf_hub_download(HF_GGUF_REPO, HF_MMPROJ_FILE, **kw)
+        model = model or hf_hub_download(repo, gguf, **kw)
+        mmproj = mmproj or hf_hub_download(repo, mmproj_file, **kw)
     return model, mmproj
 
 
 def host_port() -> tuple[str, int]:
     if URL:
-        host = URL.split("//")[-1]
-        h, _, p = host.partition(":")
-        return h, int(p or 80)
+        host, _, port = URL.split("//")[-1].partition(":")
+        return host, int(port or 80)
     return "127.0.0.1", PORT
+
+
+def _connect(timeout: float) -> http.client.HTTPConnection:
+    return http.client.HTTPConnection(*host_port(), timeout=timeout)
 
 
 def start() -> None:
@@ -64,13 +82,12 @@ def start() -> None:
          "--port", str(PORT), "-c", str(CTX), "-np", "1"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
-    host, port = host_port()
     deadline = time.time() + 180
     while time.time() < deadline:
         if _proc.poll() is not None:
             raise RuntimeError(f"llama-server exited with code {_proc.returncode}")
         try:
-            conn = http.client.HTTPConnection(host, port, timeout=2)
+            conn = _connect(timeout=2)
             conn.request("GET", "/health")
             ok = conn.getresponse().status == 200
             conn.close()
@@ -101,8 +118,7 @@ def _chat_body(messages: list, max_tokens: int, stream: bool) -> dict:
 
 def chat_blocking(messages: list, max_tokens: int) -> str:
     """Non-streaming request; returns the message content ('' on discard)."""
-    host, port = host_port()
-    conn = http.client.HTTPConnection(host, port, timeout=300)
+    conn = _connect(timeout=300)
     conn.request("POST", "/v1/chat/completions",
                  json.dumps(_chat_body(messages, max_tokens, stream=False)),
                  {"Content-Type": "application/json"})
@@ -125,8 +141,9 @@ class ChatStream:
         self.cancelled = False
 
     def run(self, on_delta):
-        host, port = host_port()
-        self.conn = http.client.HTTPConnection(host, port, timeout=300)
+        # self.conn is published before the request is sent, so a cancel()
+        # landing mid-upload still tears the socket down.
+        self.conn = _connect(timeout=300)
         self.conn.request("POST", "/v1/chat/completions", json.dumps(self.body),
                           {"Content-Type": "application/json"})
         resp = self.conn.getresponse()
