@@ -63,6 +63,28 @@ FIXTURES = {
         "Can you remind me what my name is?",
         ["name"],
     ),
+    # Delegation e2e: explicit "search the web" phrasing so the model
+    # reliably emits the <delegate> tag (see benchmarks/tagbench.py).
+    "delegate_pizza": (
+        "Can you search the web and find the best pizza place in Rome "
+        "right now?",
+        ["pizza", "rome"],
+    ),
+    # "stock" in the task makes the suite's mock reasoner fail the request
+    # (tests/conftest.py) — the failure path must end in a spoken apology.
+    "delegate_stock": (
+        "Can you search the web for the current stock price of Apple?",
+        ["stock", "apple"],
+    ),
+    # "naples" makes the mock stall 8s — long enough to prove the
+    # conversation continues while a background task runs. Current-info
+    # phrasing on purpose: for topics the model believes it knows (e.g.
+    # "the history of pizza") it acks without the tag often enough to
+    # flake, no matter how the request is worded.
+    "delegate_naples": (
+        "Can you search the web for today's weather in Naples, Italy?",
+        ["weather", "naples"],
+    ),
 }
 
 # Synthesis kwargs (see _synthesize) for base fixtures that need them.
@@ -75,7 +97,10 @@ BASE_KWARGS = {"incomplete_cutoff": {"keep_frac": 0.55}}
 VARIANTS = {
     "capital_france_clipped": ("capital_france", {"clip_end_s": 0.18}),
     "capital_france_noisy": ("capital_france", {"snr_db": 12}),
-    "long_question_male": ("long_question", {"voice": "am_michael"}),
+    # am_adam holds a clear margin below smart-turn's 0.5 threshold after
+    # the int16 WAV round-trip (0.25); am_michael sat at ~0.5 and flipped
+    # with synthesis drift, breaking the held-turn tests.
+    "long_question_male": ("long_question", {"voice": "am_adam"}),
 }
 
 

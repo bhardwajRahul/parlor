@@ -76,8 +76,10 @@ SYNTAXES = {
     "hash": {
         "example": "###DELEGATE: <the task>",
         "name": "###DELEGATE",
-        # loose: did it attempt a tag at all; strict: would production parse it
-        "loose": re.compile(r"#{2,}\s*DELEGATE|DELEGATE\s*:", re.IGNORECASE),
+        # loose: did it attempt a tag at all; strict: would production parse
+        # it. No bare 'DELEGATE:' alternative — that matches markup-free
+        # prose and would score misfires asymmetrically against hash.
+        "loose": re.compile(r"#{2,}\s*DELEGATE", re.IGNORECASE),
         "strict": re.compile(r"#{2,}[ \t]*DELEGATE[ \t]*:[ \t]*(?P<task>[^\n]+)",
                              re.IGNORECASE),
     },
@@ -90,10 +92,12 @@ SYNTAXES = {
     },
 }
 
+
 # Mirrors server.py's production prompts (imported so drift is impossible).
 def production_prompts():
     import server
-    return server.SYSTEM_PROMPT, server.RESPOND_PROMPT.format(camera="")
+    return (server.SYSTEM_PROMPT, server.RESPOND_PROMPT.format(camera=""),
+            server.DELEGATE_INSTRUCTION)
 
 
 def ensure_fixtures() -> dict[str, str]:
@@ -134,7 +138,7 @@ def judge(raw: str, syntax: str, expects_tag: bool) -> dict:
     loose = bool(s["loose"].search(raw))
     spoken = spoken_text(raw, syntax)
     # Any tag residue in what gets spoken is the worst failure mode.
-    leaked = bool(re.search(r"delegate", spoken, re.IGNORECASE)) or "##" in spoken or "<" in spoken
+    leaked = "delegate" in spoken.lower() or "##" in spoken or "<" in spoken
     return {
         "expects_tag": expects_tag,
         "well_formed": bool(strict),
@@ -162,19 +166,27 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--repeat", type=int, default=1)
     ap.add_argument("--syntaxes", default="hash,xml")
+    ap.add_argument("--production", action="store_true",
+                    help="bench server.py's DELEGATE_INSTRUCTION verbatim "
+                         "(the xml syntax it uses) instead of the symmetric "
+                         "A/B instruction — the regression guard for prompt "
+                         "changes")
     ap.add_argument("--out", default="")
     args = ap.parse_args()
 
-    system, respond = production_prompts()
+    system, respond, delegate_instruction = production_prompts()
     wavs = ensure_fixtures()
+    if args.production:
+        variants = [("production", system + delegate_instruction, "xml")]
+    else:
+        variants = [(s, system + INSTRUCTION_COMMON.format(
+                        example=SYNTAXES[s]["example"], name=SYNTAXES[s]["name"]), s)
+                    for s in args.syntaxes.split(",")]
     llama.start()
     try:
         out = {"model": llama.MODEL, "temperature": llama.TEMPERATURE,
                "repeat": args.repeat, "syntaxes": {}}
-        for syntax in args.syntaxes.split(","):
-            s = SYNTAXES[syntax]
-            sys_prompt = system + INSTRUCTION_COMMON.format(
-                example=s["example"], name=s["name"])
+        for label, sys_prompt, syntax in variants:
             results = []
             for name, wav in wavs.items():
                 expects = name in DELEGATE_CASES
@@ -192,10 +204,11 @@ def main() -> None:
                     flag = " LEAKED" if r["leaked"] else ""
                     ok = "✓" if (r["well_formed"] == expects and not r["malformed"]
                                  and not r["leaked"]) else "✗"
-                    print(f"{ok} [{syntax}] {name}: {verdict}{flag} "
+                    print(f"{ok} [{label}] {name}: {verdict}{flag} "
                           f"({time.time() - t0:.1f}s)")
-            out["syntaxes"][syntax] = {"stats": score(results), "results": results}
-            print(f"\n{syntax}: {out['syntaxes'][syntax]['stats']}\n")
+            stats = score(results)
+            out["syntaxes"][label] = {"stats": stats, "results": results}
+            print(f"\n{label}: {stats}\n")
     finally:
         llama.stop()
 

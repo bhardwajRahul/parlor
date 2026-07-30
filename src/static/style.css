@@ -316,6 +316,22 @@
     letter-spacing: 0.02em;
   }
 
+  /* A background research task in flight (delegation) */
+  .delegation-chip {
+    align-self: flex-start;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 14px;
+    border-radius: 100px;
+    background: var(--c-process-dim);
+    color: var(--c-process);
+    font-size: 12px;
+    animation: msg-in 0.25s ease-out;
+  }
+
+  .delegation-chip .loading-dots span { background: var(--c-process); }
+
   .loading-dots {
     display: inline-flex;
     gap: 4px;

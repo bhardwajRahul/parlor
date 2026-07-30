@@ -116,6 +116,16 @@ class Session:
                 return t
         return t
 
+    def wait_for(self, kind: str, timeout: float = 30) -> dict | None:
+        """Read messages until one of type `kind` arrives (others are
+        discarded); None on timeout."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            msg = self.recv(timeout=max(0.1, deadline - time.time()))
+            if msg and msg.get("type") == kind:
+                return msg
+        return None
+
     def send_speech_chunks(self, chunks: list[str], gap_s: float = 1.0) -> None:
         """Stream all but the last chunk like the client does during speech."""
         for seq, chunk in enumerate(chunks[:-1]):

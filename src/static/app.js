@@ -157,7 +157,18 @@ function setState(newState) {
   }
 }
 
-function goListening() { setState('listening'); setStatus('connected', 'Connected'); }
+// announce=false when the mic may be live (barge-in): 'ready' tells the
+// server the floor is free, so it must only be sent from genuine idle.
+// Clearing ignoreIncomingAudio in the same breath keeps the two ends
+// aligned: a server that may now deliver ⇔ a client that will play it.
+function goListening(announce = true) {
+  setState('listening');
+  setStatus('connected', 'Connected');
+  if (announce && !speechActive) {
+    ignoreIncomingAudio = false;
+    wsSend({ type: 'ready' });
+  }
+}
 function goProcessing() { setState('processing'); setStatus('processing', 'Processing'); }
 
 // ── WebSocket ──
@@ -178,6 +189,8 @@ function connect() {
     framePrefetched = false;
     serverHoldingAudio = false;
     removePendingUserBubble();
+    delegationChips.forEach(chip => chip.remove());  // tasks died with the server
+    delegationChips.clear();
     clearFlushTimer();
     setStatus('disconnected', 'Disconnected');
     setTimeout(connect, 2000);
@@ -206,7 +219,10 @@ function connect() {
       fillUserBubble(msg.transcription);
     } else if (msg.type === 'turn_final') {
       if (ignoreIncomingAudio) return;
-      if (!msg.spoke && !msg.transcription) {
+      if (msg.proactive) {
+        // Server-initiated delivery: its "transcript" is the model's own
+        // echo, and there is no pending user bubble to fill or remove.
+      } else if (!msg.spoke && !msg.transcription) {
         removePendingUserBubble();  // glitch/empty turn — nothing was heard
       } else {
         fillUserBubble(msg.transcription);
@@ -215,6 +231,7 @@ function connect() {
       if (t.llm_time) {
         setAssistantMeta((t.ttfa_s ? `first audio ${t.ttfa_s}s · ` : '') + `model ${t.llm_time}s`);
       }
+      currentAssistantEl = null;  // the next turn gets its own bubble
       if (!msg.spoke) goListening();  // no audio will follow
     } else if (msg.type === 'audio_start') {
       if (ignoreIncomingAudio) return;
@@ -232,6 +249,15 @@ function connect() {
       }
       const meta = messagesDiv.querySelector('.msg.assistant:last-child .meta');
       if (meta) meta.textContent += ` · tts ${msg.tts_time}s`;
+    } else if (msg.type === 'delegation_started') {
+      addDelegationChip(msg.id, msg.task);
+    } else if (msg.type === 'delegation_resolved') {
+      // The delivery turn follows immediately as a normal spoken turn —
+      // give it a fresh assistant bubble, and show it as thinking (which
+      // also arms the processing watchdog) if we were sitting idle.
+      currentAssistantEl = null;
+      removeDelegationChip(msg.id);
+      if (state === 'listening') goProcessing();
     }
   };
 }
@@ -262,6 +288,26 @@ function setAssistantMeta(text) {
     currentAssistantEl.appendChild(meta);
   }
   meta.textContent = text;
+}
+
+// ── Delegation chips: a background research task in flight, shown until
+// its answer arrives as a normal spoken turn. ──
+const delegationChips = new Map();
+
+function addDelegationChip(id, task) {
+  const div = document.createElement('div');
+  div.className = 'delegation-chip';
+  div.innerHTML = `${LOADING_DOTS}<span class="task"></span>`;
+  div.querySelector('.task').textContent = task;
+  messagesDiv.appendChild(div);
+  messagesDiv.scrollTop = messagesDiv.scrollHeight;
+  delegationChips.set(id, div);
+}
+
+function removeDelegationChip(id) {
+  const chip = delegationChips.get(id);
+  delegationChips.delete(id);
+  if (chip) chip.remove();
 }
 
 function pendingUserBubble() {
@@ -418,6 +464,9 @@ function handleVadFrame(probs, frame) {
       speechActive = false;
       uttFrames = [];
       uttSamplesSent = 0;
+      // The barge-in was a false alarm: re-announce idle so the server's
+      // interrupted flag doesn't strand a queued delegation delivery.
+      goListening();
       console.log('phantom capture reset (no speech after barge-in)');
       return;
     }
@@ -488,7 +537,7 @@ function triggerBargeIn() {
   stopPlayback();
   ignoreIncomingAudio = true;
   wsSend({ type: 'interrupt' });
-  goListening();
+  goListening(false);  // the mic is live — the floor is NOT free
   prefetchFrame();
   startUtteranceCapture();
   console.log('Barge-in: interrupted playback');
@@ -497,7 +546,12 @@ function triggerBargeIn() {
 function handleSpeechEnd(audio) {
   const wasStreaming = speechActive && uttSamplesSent > 0;
   speechActive = false; // always reset — a leak here streams mic audio forever
-  if (state !== 'listening' || !wsOpen()) return;
+  if (state !== 'listening' || !wsOpen()) {
+    // Utterance dropped (e.g. it ended while the assistant was speaking):
+    // its prefetched frame is stale now — the next utterance sends a fresh one.
+    framePrefetched = false;
+    return;
+  }
 
   clearFlushTimer();
   serverHoldingAudio = false;
@@ -654,6 +708,9 @@ async function init() {
       framePrefetched = false;
       speechActive = false;
       if (serverHoldingAudio) startFlushTimer();
+      // A false barge-in ends here: re-announce idle so a delegation
+      // result deferred by the interrupt isn't stranded.
+      if (state === 'listening') goListening();
       console.log('VAD misfire (too short)');
     },
     onFrameProcessed: (probs, frame) => handleVadFrame(probs, Float32Array.from(frame)),

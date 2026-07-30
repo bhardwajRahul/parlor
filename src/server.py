@@ -10,11 +10,13 @@ tail of the utterance.
 """
 
 import asyncio
+import itertools
 import json
 import os
 import sys
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -38,6 +40,7 @@ from dotenv import load_dotenv
 load_dotenv()  # before importing llama — it reads its config at import time
 
 import llama
+import reasoner
 import tts
 from pipeline import (estimate_tokens, pad_tail_silence, prime_cache,
                       release_client, run_turn, send_json, text_part,
@@ -54,6 +57,42 @@ SYSTEM_PROMPT = (
     "If an audio message is just your own previous reply playing back "
     "(echo), don't answer it — briefly ask what they'd like to talk about."
 )
+
+# Appended to the system prompt only when a reasoner endpoint is
+# configured (.env REASONER_*). An XML element, not a ###-style line:
+# benchmarks/tagbench.py measured much higher tag recall for it on E4B.
+DELEGATE_INSTRUCTION = (
+    " You also have a background research assistant with web access. When "
+    "the user asks you to search, look up, find, or research something, or "
+    "asks about anything current or changing (weather, news, prices, "
+    "scores, openings, \"right now\", \"today\"), you MUST hand the task "
+    "over instead of answering from memory — your knowledge is stale and a "
+    "guess is worse than handing over. To hand over: say one short "
+    "sentence telling the user you're on it, then append <delegate>the "
+    "task, restated to stand alone</delegate> — never speak or mention "
+    "that tag; the result arrives later and you can share it then. "
+    "Everything else, answer yourself and don't use the tag."
+)
+
+# A finished background task is delivered by the voice model, not read out
+# raw: it ties the answer back to the conversation and keeps one voice.
+DELIVER_PROMPT = (
+    'Your background research assistant just finished the task "{task}". '
+    "Its answer:\n{answer}\n\n"
+    "Deliver this answer to the user now: tie it back to what they asked "
+    "earlier, keep every fact exactly as given, 2-5 short sentences, "
+    "plain spoken text."
+)
+DELIVER_FAILED_PROMPT = (
+    'Your background research assistant could not finish the task '
+    '"{task}". Briefly tell the user you couldn\'t get that answer, and '
+    "that they're welcome to ask again. Don't start new research now."
+)
+DELIVER_FALLBACK = "Sorry — I couldn't get an answer for that one."
+
+# One session can only usefully consume a few pending research tasks, and
+# an off-the-rails reply must not queue an HTTP call per imagined tag.
+MAX_PENDING_DELEGATIONS = 3
 
 # The transcript line LEADS the reply: transcribing after the response
 # turns the transcript into a paraphrase from memory (WER 0.39 vs 0.00 on a
@@ -95,6 +134,11 @@ CONTEXT_HEADROOM = 2000
 tts_backend = None
 detector = None  # smart-turn end-of-turn classifier
 
+# Reasoner calls block for up to REASONER_TIMEOUT — keep them off the
+# default executor, which serves the latency-critical path (llama
+# streaming, TTS, the turn classifier, cache priming).
+REASONER_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="reasoner")
+
 
 def load_models():
     global tts_backend, detector
@@ -135,7 +179,10 @@ def turn_instruction(msg: dict, has_image: bool, has_audio: bool) -> str:
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
 
-    history: list = [{"role": "system", "content": SYSTEM_PROMPT}]
+    delegation = reasoner.enabled()
+    system = SYSTEM_PROMPT + (DELEGATE_INSTRUCTION if delegation else "")
+    control_tags = ("delegate",) if delegation else ()
+    history: list = [{"role": "system", "content": system}]
 
     interrupted = asyncio.Event()
     active = {"stream": None}
@@ -166,6 +213,91 @@ async def websocket_endpoint(ws: WebSocket):
     speech_chunks: list[str] = []    # streamed-in speech, already cache-primed
     held_audio: list[str] = []       # incomplete-turn segments awaiting continuation
 
+    def remember(user_msg: dict, raw_text: str) -> None:
+        """Store a finished turn verbatim (same bytes → full prefix-cache hit
+        on the next request). A turn the model produced nothing for is never
+        stored — a degenerate message poisons all later requests."""
+        if raw_text.strip():
+            history.append(user_msg)
+            history.append({"role": "assistant", "content": raw_text})
+
+    delegation_ids = itertools.count(1)
+    delegation_tasks: set[asyncio.Task] = set()
+    ready_delegations: list[dict] = []  # finished while the floor was busy
+
+    def floor_busy() -> bool:
+        """The user holds the floor: audio held for a continuation, a
+        mid-utterance chunk stream, or a just-fired barge-in. A delegation
+        result may only be delivered when this is false."""
+        return bool(held_audio or speech_chunks or interrupted.is_set())
+
+    def drain_ready() -> None:
+        """Requeue one finished delegation whenever the floor frees up —
+        called at every point that releases it, because msg_queue only
+        wakes for client traffic and a result must not wait for one."""
+        if ready_delegations and not floor_busy():
+            msg_queue.put_nowait(ready_delegations.pop(0))
+
+    async def run_delegation(task_id: int, task: str) -> None:
+        """Background reasoner call; its outcome re-enters the main loop
+        through msg_queue so delivery is serialized with real turns."""
+        try:
+            answer = await asyncio.get_event_loop().run_in_executor(
+                REASONER_POOL, reasoner.ask, task)
+            # Clamp a verbose answer: it is interpolated into the delivery
+            # prompt and stored in history under a small LLAMA_CTX.
+            if len(answer) > 1500:
+                answer = answer[:1500].rsplit(". ", 1)[0] + "."
+            outcome = {"ok": True, "answer": answer}
+        except Exception as e:
+            print(f"Delegation #{task_id} failed: {e}")
+            outcome = {"ok": False, "answer": ""}
+        await msg_queue.put({"type": "delegation_done", "id": task_id,
+                             "task": task, **outcome})
+
+    async def spawn_delegations(tags: list[tuple[str, str]]) -> None:
+        for name, value in tags:
+            if name == "DELEGATE" and value.strip():
+                if len(delegation_tasks) >= MAX_PENDING_DELEGATIONS:
+                    print(f"Delegation skipped (cap {MAX_PENDING_DELEGATIONS}): {value!r}")
+                    continue
+                task_id = next(delegation_ids)
+                print(f"Delegation #{task_id}: {value!r}")
+                await send_json(ws, {"type": "delegation_started",
+                                     "id": task_id, "task": value})
+                t = asyncio.create_task(run_delegation(task_id, value))
+                delegation_tasks.add(t)
+                t.add_done_callback(delegation_tasks.discard)
+
+    async def deliver_delegation(done: dict) -> None:
+        """A server-initiated turn: the result goes into history and the
+        voice model speaks it. Failures are delivered too — a delegation
+        must never end in silence, which is also why the fallback is the
+        reasoner's own answer: if the model's relay yields nothing
+        speakable (##-markup relapse, transcript-only reply), TTS speaks
+        the answer directly."""
+        interrupted.clear()
+        await send_json(ws, {"type": "delegation_resolved",
+                             "id": done["id"], "ok": done["ok"]})
+        prompt = (DELIVER_PROMPT if done["ok"] else DELIVER_FAILED_PROMPT).format(
+            task=done["task"], answer=done["answer"])
+        user_msg = {"role": "user", "content": [text_part(prompt)]}
+        # expect_transcript=True although there is no audio: history trains
+        # the model to open every reply with ###TRANSCRIPT:, and it often
+        # does so here too (echoing the instruction). The transcript parser
+        # consumes that line and streams the real delivery; with False the
+        # ##-markup cut would swallow the entire reply (observed live).
+        raw_text, tags = await run_turn(ws, history + [user_msg], interrupted,
+                                        active, tts_backend,
+                                        expect_transcript=True,
+                                        control_tags=control_tags,
+                                        proactive=True,
+                                        fallback=done["answer"] if done["ok"]
+                                        else DELIVER_FALLBACK)
+        remember(user_msg, raw_text)
+        await spawn_delegations(tags)  # a delivery may chain deeper research
+        drain_ready()                  # more results may already be waiting
+
     async def prime(audio_b64s: list[str]) -> None:
         """Warm the cache for the turn as it stands so far — reads the live
         history and held camera frame, so it must stay in this scope."""
@@ -184,6 +316,32 @@ async def websocket_endpoint(ws: WebSocket):
                 keep = 1 + max(2, (len(history) - 1) // 2)
                 print(f"Context near limit — dropping {len(history) - keep} oldest messages")
                 history = [history[0]] + history[-(keep - 1):]
+
+            if msg.get("type") == "ready":
+                # The client returned to idle listening (e.g. after a false
+                # barge-in that never became an utterance). A sticky
+                # interrupted flag must not strand queued deliveries — and
+                # the client cleared its own frame-discard flag before
+                # sending this, so delivering now is safe.
+                interrupted.clear()
+                drain_ready()
+                continue
+
+            if msg.get("type") == "delegation_done":
+                if floor_busy():  # deliver at the next idle moment instead
+                    ready_delegations.append(msg)
+                    continue
+                try:
+                    await deliver_delegation(msg)
+                except DISCONNECT_ERRORS:
+                    raise
+                except Exception:
+                    traceback.print_exc()  # keep the session alive
+                    if not msg.get("redelivered"):
+                        msg["redelivered"] = True  # one more try at idle
+                        ready_delegations.append(msg)
+                    await release_client(ws)
+                continue
 
             if msg.get("type") == "frame":
                 if msg.get("image"):
@@ -212,6 +370,7 @@ async def websocket_endpoint(ws: WebSocket):
             if not has_audio and not image and not msg.get("text"):
                 # Mic glitch (or a flush with nothing held) produced no usable media.
                 await release_client(ws)
+                drain_ready()  # the floor is provably free here
                 continue
 
             # From here on any failure (malformed WAV included — valid_audio
@@ -255,26 +414,28 @@ async def websocket_endpoint(ws: WebSocket):
 
                 instruction = turn_instruction(msg, bool(image), has_audio)
                 user_msg = {"role": "user", "content": content + [text_part(instruction)]}
-                raw_text = await run_turn(ws, history + [user_msg], interrupted, active,
-                                          tts_backend, expect_transcript=has_audio,
-                                          p_complete=p_complete,
-                                          fallback=FLUSH_FALLBACK if is_flush
-                                          else AUDIO_FALLBACK if has_audio else None)
-                # Store the turn verbatim (same bytes → full prefix-cache hit
-                # on the next request). Never store a turn the model produced
-                # nothing for — a degenerate message poisons all later requests.
-                if raw_text.strip():
-                    history.append(user_msg)
-                    history.append({"role": "assistant", "content": raw_text})
+                raw_text, tags = await run_turn(ws, history + [user_msg], interrupted, active,
+                                                tts_backend, expect_transcript=has_audio,
+                                                p_complete=p_complete,
+                                                control_tags=control_tags,
+                                                fallback=FLUSH_FALLBACK if is_flush
+                                                else AUDIO_FALLBACK if has_audio else None)
+                remember(user_msg, raw_text)
+                await spawn_delegations(tags)
             except DISCONNECT_ERRORS:
                 raise
             except Exception:
                 traceback.print_exc()  # keep the session alive
                 await release_client(ws)
+
+            # A result that finished while the floor was busy delivers now.
+            drain_ready()
     except DISCONNECT_ERRORS:
         print("Client disconnected")
     finally:
         recv_task.cancel()
+        for t in delegation_tasks:
+            t.cancel()
 
 
 if __name__ == "__main__":

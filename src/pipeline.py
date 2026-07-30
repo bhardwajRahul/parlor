@@ -189,6 +189,11 @@ class TagFilter:
             buf = buf[lt + 1:]
         return "".join(out)
 
+    def strip(self, text: str) -> str:
+        """Remove complete control elements from `text` (for storing an
+        interrupted turn: history must not claim an action fired)."""
+        return self._re.sub("", text)
+
 
 class StreamParser:
     """Incrementally parses '###TRANSCRIPT: <words>\\n<response>'.
@@ -299,14 +304,28 @@ class StreamParser:
 
 # ── turn execution ────────────────────────────────────────────────────────
 
+# Spoken when a turn produced a control tag but no speech at all — an
+# action must never feel like the assistant ignored the user.
+TAG_ACK = "On it — I'll have that for you in a moment."
+
+
 async def run_turn(ws, messages: list, interrupted: asyncio.Event,
                    active: dict, tts_backend, expect_transcript: bool = True,
                    p_complete: float | None = None,
-                   fallback: str | None = None) -> str:
+                   control_tags: tuple[str, ...] = (),
+                   proactive: bool = False,
+                   fallback: str | None = None) -> tuple[str, list]:
     """Stream one model turn: decode → sentences → TTS, all pipelined. The
     transcript line is pushed to the client the moment it completes, while
     the response is still decoding. Returns the raw generated text (stored
-    verbatim in history so the next request gets a full prefix-cache hit)."""
+    verbatim in history so the next request gets a full prefix-cache hit)
+    and any control tags the model emitted — empty if interrupted, so an
+    aborted turn never fires an action.
+
+    proactive marks a server-initiated turn (delegation delivery): the
+    model's transcript line is its own echo, not the user's words, so no
+    transcript frame is sent and turn_final carries proactive=True — the
+    client must never fill a user bubble from it."""
     loop = asyncio.get_event_loop()
     t0 = time.time()
     timings: dict = {}
@@ -355,7 +374,7 @@ async def run_turn(ws, messages: list, interrupted: asyncio.Event,
             audio_state["chunks"] += 1
 
     tts_task = asyncio.create_task(tts_worker())
-    parser = StreamParser(expect_transcript)
+    parser = StreamParser(expect_transcript, control_tags)
     tts_started_at = None
     transcript_sent = False
 
@@ -381,9 +400,10 @@ async def run_turn(ws, messages: list, interrupted: asyncio.Event,
                 if parser.transcript and not transcript_sent:
                     transcript_sent = True
                     timings["transcript_s"] = round(time.time() - t0, 3)
-                    await send_json(ws, {"type": "transcript",
-                                         "transcription": parser.transcript,
-                                         "p_complete": p_complete})
+                    if not proactive:
+                        await send_json(ws, {"type": "transcript",
+                                             "transcription": parser.transcript,
+                                             "p_complete": p_complete})
 
         tail, transcript = parser.finalize()
         timings["llm_time"] = round(time.time() - t0, 3)
@@ -391,13 +411,15 @@ async def run_turn(ws, messages: list, interrupted: asyncio.Event,
 
         if not interrupted.is_set():
             await dispatch(tail)
-            if fallback and tts_started_at is None:
-                # The model emitted only a transcript line (models of every
-                # size sometimes do this for cut-off audio) — a flush turn
-                # must never end in silence, so speak the fallback and keep
-                # history coherent with what was actually said.
-                raw["text"] += "\n" + fallback
-                await dispatch([fallback])
+            # A turn may still end with nothing spoken: only a transcript
+            # line (models of every size do this for cut-off audio), or only
+            # a control tag. Neither may end in silence — speak the ack or
+            # the caller's fallback, and keep history coherent with what was
+            # actually said.
+            say = TAG_ACK if parser.tags else fallback
+            if tts_started_at is None and say:
+                raw["text"] += "\n" + say
+                await dispatch([say])
     finally:
         active["stream"] = None
         sentence_q.put_nowait(_DONE)
@@ -419,11 +441,15 @@ async def run_turn(ws, messages: list, interrupted: asyncio.Event,
 
     if interrupted.is_set():
         print("Interrupted mid-turn")
-        return raw["text"]
+        # An aborted turn fires nothing, so its stored text must not carry
+        # a tag either — the model must not believe it already delegated.
+        text = parser._filter.strip(raw["text"]) if parser._filter else raw["text"]
+        return text, []
 
     await send_json(ws, {
         "type": "turn_final",
-        "transcription": transcript,
+        "transcription": None if proactive else transcript,
+        "proactive": proactive,
         "timings": timings,
         "p_complete": p_complete,
         "spoke": audio_state["started"],  # False → client must not wait for audio_end
@@ -431,7 +457,7 @@ async def run_turn(ws, messages: list, interrupted: asyncio.Event,
     if audio_state["started"]:
         await send_json(ws, {"type": "audio_end",
                              "tts_time": timings.get("tts_time", 0)})
-    return raw["text"]
+    return raw["text"], parser.tags
 
 
 async def prime_cache(messages: list) -> None:

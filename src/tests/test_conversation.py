@@ -57,7 +57,12 @@ def test_continuation_merges_held_audio(session):
     assert t.marker == "complete"
     merged = (t.transcription or "").lower()
     assert "ask" in merged and "paris" in merged, f"lost part of the utterance: {merged!r}"
-    assert any(w in t.text.lower() for w in ("weather", "paris", "trip"))
+    # A weather question is delegation bait (DELEGATE_INSTRUCTION): the
+    # reply may answer directly or acknowledge and hand it to the reasoner
+    # — either proves the model worked from the full merged utterance.
+    reply = t.text.lower()
+    on_topic = any(w in reply for w in ("weather", "paris", "trip", "forecast"))
+    assert on_topic or session.wait_for("delegation_started", timeout=5), reply
 
 
 @pytest.mark.skip(reason="the TTS fixture has finished-sounding falling prosody, which "
