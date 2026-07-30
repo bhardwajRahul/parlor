@@ -348,17 +348,24 @@ let uttSamplesSent = 0;
 let chunkSeq = 0;
 let speechActive = false;
 
-let bargeFrames = 0; // consecutive high-probability speech frames while TTS plays
+let bargeWindow = []; // 1/0 per recent frame: speech probability while TTS plays
 
 function handleVadFrame(probs, frame) {
-  // Barge-in needs ~250ms of SUSTAINED speech, not a single loud frame —
-  // otherwise the mic catching our own TTS interrupts the reply (echo).
+  // Barge-in needs SUSTAINED speech, not a single loud frame — otherwise
+  // the mic catching our own TTS interrupts the reply (echo). But real
+  // speech dips at every consonant and word boundary, so a consecutive-
+  // frames counter never fires on a live mic: score a sliding window
+  // (6 of the last 10 frames ≈ 200-320ms of mostly-speech) instead.
   if (state === 'speaking') {
-    bargeFrames = (probs && probs.isSpeech > 0.92) ? bargeFrames + 1 : 0;
-    if (bargeFrames >= 8) { bargeFrames = 0; triggerBargeIn(); }
+    bargeWindow.push(probs && probs.isSpeech > 0.85 ? 1 : 0);
+    if (bargeWindow.length > 10) bargeWindow.shift();
+    if (bargeWindow.reduce((a, b) => a + b, 0) >= 6) {
+      bargeWindow = [];
+      triggerBargeIn();
+    }
     return;
   }
-  bargeFrames = 0;
+  bargeWindow = [];
   if (speechActive && state === 'listening') {
     uttFrames.push(frame);
     const total = totalSamples(uttFrames);
