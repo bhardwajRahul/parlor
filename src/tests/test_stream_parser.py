@@ -13,7 +13,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from pipeline import StreamParser  # noqa: E402
+from pipeline import StreamParser, echoes_instruction  # noqa: E402
 
 
 def run(deltas, expect_transcript=True):
@@ -270,6 +270,40 @@ def test_streaming_matches_batch_for_every_split_point_with_tags(text):
     batch = run_tags([text])
     for i in range(1, len(text)):
         assert run_tags([text[:i], text[i:]]) == batch, f"diverged at split {i}"
+
+
+# ── instruction-echo guard ────────────────────────────────────────────────
+# Live bug: on a flush turn the model sometimes echoes the instruction
+# text into its ###TRANSCRIPT: line, and the client displays it as the
+# user's words. The guard suppresses any transcript sharing a 5-word run
+# with the turn's instruction.
+
+def test_instruction_echo_is_detected_against_production_prompts():
+    import server
+    flush = server.FLUSH_PROMPT.format(camera="")
+    # The observed leak: instruction text verbatim (with or without the
+    # model tacking invented words on the end).
+    assert echoes_instruction("The user paused mid-thought, so on a new line:", flush)
+    assert echoes_instruction(
+        "The user paused mid-thought, so on a new line: hello there", flush)
+    respond = server.RESPOND_PROMPT.format(camera="")
+    assert echoes_instruction(
+        "followed by the exact words the user said in their audio message", respond)
+
+
+def test_genuine_transcripts_pass_the_echo_guard():
+    import server
+    for prompt in (server.FLUSH_PROMPT.format(camera=""),
+                   server.RESPOND_PROMPT.format(camera=""),
+                   server.TRANSLATE_PROMPT):
+        for said in ("What is the capital of France?",
+                     "So the thing I wanted to ask you about is the weather "
+                     "in Paris for my trip next week.",
+                     "I have been trying to learn English for a few months now.",
+                     "Please respond to them, all of them, by email."):
+            assert not echoes_instruction(said, prompt), (said, prompt[:40])
+    # Too short to judge stays visible.
+    assert not echoes_instruction("On a new line", "so on a new line: x")
 
 
 def test_production_filter_knows_every_control_tag():

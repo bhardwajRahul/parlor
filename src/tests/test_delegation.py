@@ -69,7 +69,8 @@ def test_conversation_continues_while_delegation_runs(server, session, reasoner_
     assert resolved and resolved["ok"] is True
     delivery = session.collect_turn(timeout=60)
     assert delivery.marker == "complete", delivery
-    assert "bonci" in delivery.text.lower() or "pizzarium" in delivery.text.lower()
+    assert "twenty-nine" in delivery.text.lower() or "sunny" in delivery.text.lower(), (
+        f"delivery lost the answer: {delivery.text!r}")
 
 
 def test_failed_delegation_is_spoken_not_silent(server, session):

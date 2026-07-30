@@ -310,6 +310,34 @@ class StreamParser:
 TAG_ACK = "Okay — one moment."
 
 
+def _norm_words(text: str) -> list[str]:
+    return re.sub(r"[^a-z0-9' ]+", " ", text.lower()).split()
+
+
+def echoes_instruction(transcript: str, instruction: str, n: int = 5) -> bool:
+    """True when the model's transcript line is an echo of the turn's own
+    instruction text rather than the user's words — e.g. a flush turn's
+    '###TRANSCRIPT: The user paused mid-thought, so on a new line: …',
+    which the client would display as something the user said. Any run of
+    n consecutive transcript words appearing verbatim in the instruction
+    is an echo; genuine speech doesn't reproduce 5-word runs of prompt
+    text, and shorter overlaps ('what you see') are common English."""
+    words = _norm_words(transcript)
+    if len(words) < n:
+        return False
+    haystack = " " + " ".join(_norm_words(instruction)) + " "
+    return any(" " + " ".join(words[i:i + n]) + " " in haystack
+               for i in range(len(words) - n + 1))
+
+
+def _instruction_text(messages: list) -> str:
+    content = messages[-1].get("content", "")
+    if isinstance(content, str):
+        return content
+    return " ".join(p.get("text", "") for p in content
+                    if isinstance(p, dict) and p.get("type") == "text")
+
+
 async def run_turn(ws, messages: list, interrupted: asyncio.Event,
                    active: dict, tts_backend, expect_transcript: bool = True,
                    p_complete: float | None = None,
@@ -380,6 +408,15 @@ async def run_turn(ws, messages: list, interrupted: asyncio.Event,
     parser = StreamParser(expect_transcript, control_tags)
     tts_started_at = None
     transcript_sent = False
+    instruction = _instruction_text(messages)
+
+    def clean_transcript(text: str | None) -> str | None:
+        """The client shows this as the user's words — never instruction
+        text the model echoed (a live flush-turn bug on real mics)."""
+        if text and echoes_instruction(text, instruction):
+            print(f"Transcript suppressed (instruction echo): {text!r}")
+            return None
+        return text
 
     async def dispatch(sentences: list[str]):
         nonlocal tts_started_at
@@ -403,9 +440,10 @@ async def run_turn(ws, messages: list, interrupted: asyncio.Event,
                 if parser.transcript and not transcript_sent:
                     transcript_sent = True
                     timings["transcript_s"] = round(time.time() - t0, 3)
-                    if not proactive:
+                    shown = clean_transcript(parser.transcript)
+                    if shown and not proactive:
                         await send_json(ws, {"type": "transcript",
-                                             "transcription": parser.transcript,
+                                             "transcription": shown,
                                              "p_complete": p_complete})
 
         tail, transcript = parser.finalize()
@@ -453,7 +491,7 @@ async def run_turn(ws, messages: list, interrupted: asyncio.Event,
 
     await send_json(ws, {
         "type": "turn_final",
-        "transcription": None if proactive else transcript,
+        "transcription": None if proactive else clean_transcript(transcript),
         "proactive": proactive,
         "timings": timings,
         "p_complete": p_complete,

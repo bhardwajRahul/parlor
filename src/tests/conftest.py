@@ -32,8 +32,13 @@ TEST_REASONER_PORT = 8823
 STARTUP_TIMEOUT_S = 300
 
 # Distinctive so a delivery turn provably carries the reasoner's facts.
+# The stalled weather task gets a weather-shaped answer: the delivery
+# prompt demands word-for-word relay, and a mismatched answer (pizza for
+# a weather question) makes the model reject it and hallucinate instead.
 MOCK_ANSWER = ("The clear winner right now is Pizzarium Bonci near the "
                "Vatican, famous for its crispy square pizza slices.")
+MOCK_WEATHER_ANSWER = ("The weather in Naples right now is sunny and "
+                       "twenty-nine degrees, with clear skies all afternoon.")
 
 
 class _ReasonerHandler(http.server.BaseHTTPRequestHandler):
@@ -57,10 +62,12 @@ class _ReasonerHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(500)
             self.end_headers()
             return
+        answer = MOCK_ANSWER
         if b"naples" in low:
             time.sleep(8)
+            answer = MOCK_WEATHER_ANSWER
         payload = json.dumps(
-            {"choices": [{"message": {"content": MOCK_ANSWER}}]}).encode()
+            {"choices": [{"message": {"content": answer}}]}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))

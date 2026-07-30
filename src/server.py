@@ -109,9 +109,10 @@ TRANSLATE_PROMPT = (
 DELIVER_PROMPT = (
     "System note (not user audio): your background research assistant "
     'just finished the task "{task}". Its answer:\n{answer}\n\n'
-    "Tell the user this answer now: tie it back to what they asked "
-    "earlier, keep every fact exactly as given, 2-5 short sentences, "
-    "plain spoken text."
+    "Tell the user now: one short lead-in sentence tying it back to what "
+    "they asked, then the answer itself word-for-word. Never drop or "
+    "change a name, number, or place — the words above are already "
+    "spoken-style. Plain spoken text."
 )
 DELIVER_FAILED_PROMPT = (
     "System note (not user audio): your background research assistant "
