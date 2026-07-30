@@ -110,8 +110,8 @@ uv run pytest            # ~1 minute + model load
 ```
 
 Set `PARLOR_TEST_URL=ws://localhost:8000/ws` to run it against an
-already-running server. Browser-only behavior (echo cancellation, VAD feel,
-multilingual speech) still needs the manual checklist in `HANDOFF.md`.
+already-running server. Browser-only behavior (echo at speaker volume, VAD
+feel, multilingual speech) still needs a live mic and ears.
 
 ## Project structure
 
@@ -130,8 +130,7 @@ src/
     ├── bench.py           # End-to-end latency benchmark
     ├── fixtures.py        # Spoken-audio fixtures (synthesized locally)
     ├── compare.py         # Diff two benchmark result files
-    ├── turnbench.py       # Turn-detection accuracy benchmark
-    └── experiment_*.py    # Recorded dead ends (see commit messages)
+    └── turnbench.py       # Turn-detection accuracy benchmark
 ```
 
 ## Acknowledgments

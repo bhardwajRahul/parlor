@@ -1,7 +1,7 @@
-"""E2E conversation coverage (HANDOFF A/B/D/F): turn-taking, chunked speech
+"""E2E conversation coverage: turn-taking, chunked speech
 overlap, camera grounding, transcript accuracy, response quality.
 
-Not automatable here (needs a browser + live mic — see HANDOFF.md): echo /
+Not automatable here (needs a browser + live mic): echo /
 AEC behavior, VAD feel and barge-in prosody, non-English speech.
 """
 
@@ -62,7 +62,7 @@ def test_continuation_merges_held_audio(session):
 
 @pytest.mark.skip(reason="the TTS fixture has finished-sounding falling prosody, which "
                          "the acoustic classifier correctly reads as complete — real "
-                         "hesitation must be judged live (HANDOFF A)")
+                         "hesitation must be judged live")
 def test_thinking_pause_is_held(session):
     t = session.turn(audio("thinking_pause"))
     assert t.marker == "incomplete"

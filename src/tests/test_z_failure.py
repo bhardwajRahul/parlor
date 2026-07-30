@@ -1,4 +1,4 @@
-"""Destructive last test (HANDOFF E): llama-server dies mid-session.
+"""Destructive last test: llama-server dies mid-session.
 
 Runs last (file name order) because it kills the suite server's llama.cpp
 child; every turn after that can only fail gracefully.

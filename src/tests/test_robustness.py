@@ -1,4 +1,4 @@
-"""E2E robustness coverage (HANDOFF C/E): interrupts, glitch audio, queued
+"""E2E robustness coverage: interrupts, glitch audio, queued
 turns, per-connection isolation, context rotation."""
 
 import fixtures as fx

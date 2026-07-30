@@ -18,9 +18,9 @@ import numpy as np
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 TARGET_SR = 16000
 
-# name -> (spoken text, keywords expected in the transcript). The keywords are
-# read by the frozen experiment_*.py scripts; the e2e suite asserts on the
-# spoken text via word error rate instead.
+# name -> (spoken text, keywords expected in the transcript). The e2e suite
+# asserts on the spoken text via word error rate; the keywords remain for
+# quick greps and ad-hoc scripts.
 FIXTURES = {
     "capital_france": (
         "What is the capital of France?",
