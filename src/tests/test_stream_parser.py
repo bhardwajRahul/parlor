@@ -164,13 +164,28 @@ def test_open_tag_value_is_never_extracted_or_spoken_early():
     assert p.tags == [("DELEGATE", "first half second half")]
 
 
-def test_unclosed_tag_at_stream_end_is_dropped_not_spoken():
-    # Truncated stream (or the model forgot the close tag): firing a
-    # half-task or speaking the markup are both worse than dropping it.
+def test_unclosed_tag_at_stream_end_fires_but_is_never_spoken():
+    # The model often hits EOS before the close tag (measured live: a
+    # third of '<mode>conversation' exits ended unclosed). At end of
+    # stream the value is as complete as it will ever be — extract it,
+    # still never speak it.
     spoken, _, tags = run_tags(["###TRANSCRIPT: hi\n", "Sure. ",
                                 "<delegate>look something up"])
     assert spoken == ["Sure."]
-    assert tags == []
+    assert tags == [("DELEGATE", "look something up")]
+    spoken, _, tags = run_tags(["###TRANSCRIPT: ok\n",
+                                "Back to normal. <mode>conversation"])
+    assert spoken == ["Back to normal."]
+    assert tags == [("MODE", "conversation")]
+
+
+def test_half_open_tag_at_stream_end_still_drops():
+    # Only a complete opening bracket with a value fires at EOS; a
+    # fragment ('<dele', '<mode>') never does.
+    for tail in ["<dele", "<mode>", "<mode >  "]:
+        spoken, _, tags = run_tags(["###TRANSCRIPT: hi\n", "Okay. ", tail])
+        assert spoken == ["Okay."], tail
+        assert tags == [], tail
 
 
 def test_speech_resumes_after_a_tag():

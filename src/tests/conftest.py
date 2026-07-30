@@ -134,8 +134,13 @@ def server(tmp_path_factory, reasoner_mock) -> Server:
     # are iterating on tests). The reasoner points at the suite's mock, so
     # every e2e test runs under the delegation-enabled system prompt —
     # exactly what production runs when a key is configured.
+    # TEMPERATURE pinned to 0: the suite verifies machinery and must be
+    # deterministic — at 0.7 every delegation/mode-switch ask is a ~0.8
+    # coin flip and some run always loses one. Production recall at real
+    # temperature is tagbench --production's job, not the suite's.
     env = {**os.environ, "PORT": str(TEST_PORT), "LLAMA_PORT": str(TEST_LLAMA_PORT),
            "LLAMA_CTX": "4096", "MODEL": os.environ.get("MODEL", "e4b"),
+           "TEMPERATURE": os.environ.get("TEMPERATURE", "0"),
            "REASONER_BASE_URL": f"http://127.0.0.1:{TEST_REASONER_PORT}/v1",
            "REASONER_API_KEY": "test-key", "REASONER_MODEL": "mock-model",
            "REASONER_TIMEOUT": "20"}

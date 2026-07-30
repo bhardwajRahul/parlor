@@ -96,9 +96,11 @@ TRANSLATE_PROMPT = (
     "their original language. Then, on a new line, write ONLY the English "
     "translation of those words — no commentary, no answers, no opinions. "
     "If they already spoke English, restate their words in clear English. "
-    "Exception: if they are clearly addressing YOU with a command to stop "
-    "or change translation (\"stop translating\", \"back to normal\"), "
-    "confirm in one short sentence and append <mode>conversation</mode>."
+    "ONE exception: if their words are a command TO YOU to stop or leave "
+    "translation — like \"stop translating\", \"go back to normal "
+    "conversation\", \"berhenti menerjemahkan\", \"deja de traducir\" — do "
+    "NOT translate it: confirm in one short sentence and end with "
+    "<mode>conversation</mode>."
 )
 
 # A finished background task is delivered by the voice model, not read out
@@ -263,12 +265,17 @@ async def websocket_endpoint(ws: WebSocket):
     delegation_ids = itertools.count(1)
     delegation_tasks: set[asyncio.Task] = set()
     ready_delegations: list[dict] = []  # finished while the floor was busy
+    playing_since = {"t": 0.0}  # last spoken reply is (probably) still playing
 
     def floor_busy() -> bool:
-        """The user holds the floor: audio held for a continuation, a
-        mid-utterance chunk stream, or a just-fired barge-in. A delegation
-        result may only be delivered when this is false."""
-        return bool(held_audio or speech_chunks or interrupted.is_set())
+        """The floor is held by the user (audio held for a continuation, a
+        mid-utterance chunk stream, a just-fired barge-in) or by our own
+        voice: a spoken reply counts as playing until the client's 'ready'
+        says playback ended — a delivery starting mid-playback would cut
+        the reply off mid-sentence. The 30s staleness escape means a lost
+        'ready' can only delay a result, never strand it."""
+        playing = playing_since["t"] and time.time() - playing_since["t"] < 30
+        return bool(held_audio or speech_chunks or interrupted.is_set() or playing)
 
     def drain_ready() -> None:
         """Requeue one finished delegation whenever the floor frees up —
@@ -370,6 +377,8 @@ async def websocket_endpoint(ws: WebSocket):
                                         proactive=True,
                                         fallback=done["answer"] if done["ok"]
                                         else DELIVER_FALLBACK)
+        if raw_text.strip():
+            playing_since["t"] = time.time()  # this delivery is now playing
         remember(user_msg, raw_text)
         await spawn_delegations(tags)  # a delivery may chain deeper research
         drain_ready()                  # more results may already be waiting
@@ -394,11 +403,12 @@ async def websocket_endpoint(ws: WebSocket):
                 history = [history[0]] + history[-(keep - 1):]
 
             if msg.get("type") == "ready":
-                # The client returned to idle listening (e.g. after a false
-                # barge-in that never became an utterance). A sticky
+                # The client returned to idle listening: playback finished,
+                # or a false barge-in never became an utterance. A sticky
                 # interrupted flag must not strand queued deliveries — and
                 # the client cleared its own frame-discard flag before
                 # sending this, so delivering now is safe.
+                playing_since["t"] = 0.0
                 interrupted.clear()
                 drain_ready()
                 continue
@@ -518,6 +528,8 @@ async def websocket_endpoint(ws: WebSocket):
                                                 tts_voice=mode.tts_voice,
                                                 fallback=FLUSH_FALLBACK if is_flush
                                                 else AUDIO_FALLBACK if has_audio else None)
+                if raw_text.strip():
+                    playing_since["t"] = time.time()  # reply now playing client-side
                 remember(user_msg, raw_text)
                 await spawn_delegations(tags)
                 await apply_mode_tags(tags)

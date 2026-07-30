@@ -142,6 +142,13 @@ class TagFilter:
         self._re = re.compile(
             rf"<\s*(?P<name>{alt})\s*>\s*(?P<value>.*?)\s*<\s*/\s*(?P=name)\s*>",
             re.IGNORECASE | re.DOTALL)
+        # An element left unclosed at end of stream (see finalize), and
+        # the same shape anywhere-to-end-of-text (for strip).
+        self._unclosed_re = re.compile(
+            rf"^<\s*(?P<name>{alt})\s*>\s*(?P<value>\S.*?)\s*$",
+            re.IGNORECASE | re.DOTALL)
+        self._tail_open_re = re.compile(rf"<\s*(?:{alt})\s*>.*$",
+                                        re.IGNORECASE | re.DOTALL)
         # A complete opening bracket: the element is committed, hold until
         # its close tag (or end of stream) decides it.
         self._open_re = re.compile(rf"^<\s*(?:{alt})\s*>", re.IGNORECASE)
@@ -189,10 +196,26 @@ class TagFilter:
             buf = buf[lt + 1:]
         return "".join(out)
 
+    def finalize(self) -> None:
+        """End of stream. An element still open here is the model hitting
+        EOS before the close tag — measured live, a third of exit-command
+        '<mode>conversation' switches end exactly like that. The value is
+        as complete as it will ever be, so extract it (still never
+        spoken). A mid-stream half value can never fire — this only runs
+        when no more text is coming — and the residual truncation risk is
+        benign: an incomplete mode value no-ops, a delegation task has
+        the cap/clamp guards."""
+        m = self._unclosed_re.match(self._held)
+        if m and not self._dead:
+            self.tags.append((m.group("name").upper(), m.group("value").strip()))
+        self._held = ""
+
     def strip(self, text: str) -> str:
-        """Remove complete control elements from `text` (for storing an
-        interrupted turn: history must not claim an action fired)."""
-        return self._re.sub("", text)
+        """Remove control elements, closed or unclosed-at-end, from `text`
+        (for storing an interrupted turn: history must not claim an action
+        fired). After closed elements are gone, any remaining open tag runs
+        to the end of the text by construction."""
+        return self._tail_open_re.sub("", self._re.sub("", text))
 
 
 class StreamParser:
@@ -296,6 +319,8 @@ class StreamParser:
             else:
                 self.response = self._release(self._buf)
             self._awaiting = False
+        if self._filter:
+            self._filter.finalize()  # an element left open at EOS still fires
         sentences = self._complete_sentences()
         # Cut any imitated tag markup — never speak it.
         tail = re.split(r"#{2,}", self.response[self._emitted:])[0].strip()
