@@ -42,6 +42,7 @@ load_dotenv()  # before importing llama — it reads its config at import time
 import llama
 import reasoner
 import tts
+from modes import MODES
 from pipeline import (estimate_tokens, pad_tail_silence, prime_cache,
                       release_client, run_turn, send_json, text_part,
                       user_content, valid_audio, wav_to_float32)
@@ -74,25 +75,62 @@ DELEGATE_INSTRUCTION = (
     "Everything else, answer yourself and don't use the tag."
 )
 
+# The mode-switch instruction lives in the per-turn prompt, not the
+# system prompt: E4B acts on the instruction adjacent to the audio (like
+# the ###TRANSCRIPT line, 6/6 in probing) and ignores the same words in
+# the system prompt entirely (0/6, even with few-shot examples) — for
+# translation it believes it already has the capability, so only the
+# always-attended slot makes it emit the switch.
+MODE_SUFFIX = (
+    " If the audio asks you to translate everything they say from now on, "
+    "confirm briefly and end with <mode>translate</mode>."
+)
+
+# The per-utterance instruction in translate mode. It carries the exit
+# path itself: in this mode every utterance is content to translate, so
+# the one exception (a command addressed to the assistant about the
+# session) must be spelled out where the translating happens.
+TRANSLATE_PROMPT = (
+    "Live translation mode. Begin your reply with one line: ###TRANSCRIPT: "
+    "followed by the exact words the user said in their audio message, in "
+    "their original language. Then, on a new line, write ONLY the English "
+    "translation of those words — no commentary, no answers, no opinions. "
+    "If they already spoke English, restate their words in clear English. "
+    "Exception: if they are clearly addressing YOU with a command to stop "
+    "or change translation (\"stop translating\", \"back to normal\"), "
+    "confirm in one short sentence and append <mode>conversation</mode>."
+)
+
 # A finished background task is delivered by the voice model, not read out
 # raw: it ties the answer back to the conversation and keeps one voice.
+# "System note (not user audio)" leads both prompts because the model
+# occasionally misread the text-only turn as its own reply playing back
+# and gave the anti-echo response instead of the answer (observed live).
 DELIVER_PROMPT = (
-    'Your background research assistant just finished the task "{task}". '
-    "Its answer:\n{answer}\n\n"
-    "Deliver this answer to the user now: tie it back to what they asked "
+    "System note (not user audio): your background research assistant "
+    'just finished the task "{task}". Its answer:\n{answer}\n\n'
+    "Tell the user this answer now: tie it back to what they asked "
     "earlier, keep every fact exactly as given, 2-5 short sentences, "
     "plain spoken text."
 )
 DELIVER_FAILED_PROMPT = (
-    'Your background research assistant could not finish the task '
-    '"{task}". Briefly tell the user you couldn\'t get that answer, and '
-    "that they're welcome to ask again. Don't start new research now."
+    "System note (not user audio): your background research assistant "
+    'could not finish the task "{task}". Briefly tell the user you '
+    "couldn't get that answer, and that they're welcome to ask again. "
+    "Don't start new research now."
 )
 DELIVER_FALLBACK = "Sorry — I couldn't get an answer for that one."
 
 # One session can only usefully consume a few pending research tasks, and
 # an off-the-rails reply must not queue an HTTP call per imagined tag.
 MAX_PENDING_DELEGATIONS = 3
+
+# The stream filter must ALWAYS know every control-tag name any prompt can
+# incite — the system prompt (with its delegate instruction) is the
+# prefix-cache prefix and survives mode switches, and a name the filter
+# doesn't know is spoken aloud, task text included. Modes gate ACTING on a
+# tag (spawn_delegations, apply_mode_tags), never parsing it.
+CONTROL_TAGS = ("delegate", "mode")
 
 # The transcript line LEADS the reply: transcribing after the response
 # turns the transcript into a paraphrase from memory (WER 0.39 vs 0.00 on a
@@ -181,8 +219,8 @@ async def websocket_endpoint(ws: WebSocket):
 
     delegation = reasoner.enabled()
     system = SYSTEM_PROMPT + (DELEGATE_INSTRUCTION if delegation else "")
-    control_tags = ("delegate",) if delegation else ()
     history: list = [{"role": "system", "content": system}]
+    mode = MODES["conversation"]
 
     interrupted = asyncio.Event()
     active = {"stream": None}
@@ -234,9 +272,40 @@ async def websocket_endpoint(ws: WebSocket):
     def drain_ready() -> None:
         """Requeue one finished delegation whenever the floor frees up —
         called at every point that releases it, because msg_queue only
-        wakes for client traffic and a result must not wait for one."""
-        if ready_delegations and not floor_busy():
+        wakes for client traffic and a result must not wait for one.
+        Results also wait out translation mode: an English research answer
+        must not barge into an interpreting session."""
+        if mode.allows_delegation and ready_delegations and not floor_busy():
             msg_queue.put_nowait(ready_delegations.pop(0))
+
+    async def switch_mode(name: str) -> None:
+        """Enter a mode by name (model tag or UI escape hatch). Unknown and
+        already-current names are no-ops, so callers can pass raw values."""
+        nonlocal mode, frame_image, speech_chunks, held_audio
+        name = name.strip().lower()
+        if name == mode.name:
+            return
+        if name not in MODES:
+            # The model confirmed something out loud and then emitted junk —
+            # make that diagnosable instead of a silent nothing.
+            print(f"Ignoring unknown mode {name!r}")
+            return
+        mode = MODES[name]
+        # Start the new mode clean: a switch through the UI escape hatch can
+        # fire with audio held under the OLD mode's gating, and translate
+        # mode never resolves holds — stale held state would keep
+        # floor_busy() true and block deliveries for the whole session.
+        frame_image = None
+        speech_chunks = []
+        held_audio = []
+        print(f"Mode → {mode.name}")
+        await send_json(ws, {"type": "mode_changed", "mode": mode.name})
+        drain_ready()  # leaving translation frees deferred deliveries
+
+    async def apply_mode_tags(tags: list[tuple[str, str]]) -> None:
+        for name, value in tags:
+            if name == "MODE":
+                await switch_mode(value)
 
     async def run_delegation(task_id: int, task: str) -> None:
         """Background reasoner call; its outcome re-enters the main loop
@@ -256,6 +325,11 @@ async def websocket_endpoint(ws: WebSocket):
                              "task": task, **outcome})
 
     async def spawn_delegations(tags: list[tuple[str, str]]) -> None:
+        if not delegation or not mode.allows_delegation:
+            # The filter still parses <delegate> here (so it is never
+            # spoken); without a reasoner, or mid-translation, it must
+            # also never fire.
+            return
         for name, value in tags:
             if name == "DELEGATE" and value.strip():
                 if len(delegation_tasks) >= MAX_PENDING_DELEGATIONS:
@@ -290,7 +364,8 @@ async def websocket_endpoint(ws: WebSocket):
         raw_text, tags = await run_turn(ws, history + [user_msg], interrupted,
                                         active, tts_backend,
                                         expect_transcript=True,
-                                        control_tags=control_tags,
+                                        control_tags=CONTROL_TAGS,
+                                        tts_voice=mode.tts_voice,
                                         proactive=True,
                                         fallback=done["answer"] if done["ok"]
                                         else DELIVER_FALLBACK)
@@ -327,9 +402,23 @@ async def websocket_endpoint(ws: WebSocket):
                 drain_ready()
                 continue
 
+            if msg.get("type") == "set_mode":
+                # The UI escape hatch (mode chip's stop button): a switch
+                # that must work even when the model mistranslates the
+                # spoken exit command.
+                await switch_mode(str(msg.get("mode", "")))
+                continue
+
             if msg.get("type") == "delegation_done":
-                if floor_busy():  # deliver at the next idle moment instead
+                if not mode.allows_delegation:
+                    # Parked until the user exits translation — tell the
+                    # client so its chip stops implying work in progress.
+                    await send_json(ws, {"type": "delegation_parked",
+                                         "id": msg["id"]})
                     ready_delegations.append(msg)
+                    continue
+                if floor_busy():
+                    ready_delegations.append(msg)  # deliver at the next idle moment
                     continue
                 try:
                     await deliver_delegation(msg)
@@ -344,7 +433,7 @@ async def websocket_endpoint(ws: WebSocket):
                 continue
 
             if msg.get("type") == "frame":
-                if msg.get("image"):
+                if msg.get("image") and mode.wants_camera:
                     frame_image = msg["image"]
                     speech_chunks = []
                     await prime(held_audio)
@@ -363,7 +452,7 @@ async def websocket_endpoint(ws: WebSocket):
             speech_chunks = []
             if valid_audio(msg.get("audio")):
                 audio_b64s.append(msg["audio"])
-            image = msg.get("image") or frame_image
+            image = (msg.get("image") or frame_image) if mode.wants_camera else None
             has_audio = bool(audio_b64s)
             is_flush = msg.get("type") == "flush"
 
@@ -382,8 +471,10 @@ async def websocket_endpoint(ws: WebSocket):
                 # involved at all. Incomplete → hold the segments (they stay
                 # in the next turn's content AND warm in the cache) and wait.
                 # A flush turn skips the check: the client waited out the
-                # hold and now wants an answer to whatever we have.
-                if has_audio and not is_flush:
+                # hold and now wants an answer to whatever we have. Translate
+                # mode skips it entirely — an interpreter renders on a short
+                # silence, it does not wait out thinking pauses.
+                if has_audio and not is_flush and mode.uses_smart_turn:
                     pcm = np.concatenate([wav_to_float32(b) for b in audio_b64s])
                     t0 = time.time()
                     complete, prob = await asyncio.get_event_loop().run_in_executor(
@@ -412,16 +503,23 @@ async def websocket_endpoint(ws: WebSocket):
                 frame_image = None
                 held_audio = []
 
-                instruction = turn_instruction(msg, bool(image), has_audio)
+                if mode.name == "translate" and has_audio:
+                    instruction = TRANSLATE_PROMPT
+                else:
+                    instruction = turn_instruction(msg, bool(image), has_audio)
+                    if has_audio:
+                        instruction += MODE_SUFFIX
                 user_msg = {"role": "user", "content": content + [text_part(instruction)]}
                 raw_text, tags = await run_turn(ws, history + [user_msg], interrupted, active,
                                                 tts_backend, expect_transcript=has_audio,
                                                 p_complete=p_complete,
-                                                control_tags=control_tags,
+                                                control_tags=CONTROL_TAGS,
+                                                tts_voice=mode.tts_voice,
                                                 fallback=FLUSH_FALLBACK if is_flush
                                                 else AUDIO_FALLBACK if has_audio else None)
                 remember(user_msg, raw_text)
                 await spawn_delegations(tags)
+                await apply_mode_tags(tags)
             except DISCONNECT_ERRORS:
                 raise
             except Exception:

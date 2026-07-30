@@ -85,6 +85,31 @@ FIXTURES = {
         "Can you search the web for today's weather in Naples, Italy?",
         ["weather", "naples"],
     ),
+    # Alternate phrasings for the delegation tests' retry: re-sending the
+    # SAME audio tends to reproduce the same tagless completion (cached
+    # prefix, near-deterministic sampling), so a retry only decorrelates
+    # with different words. Trigger keywords ('stock', 'naples') preserved.
+    "delegate_pizza_alt": (
+        "Please look up the best pizza places in Rome right now.",
+        ["pizza", "rome"],
+    ),
+    "delegate_stock_alt": (
+        "Please look up Apple's current stock price on the web for me.",
+        ["stock", "apple"],
+    ),
+    "delegate_naples_alt": (
+        "Please look up the current weather in Naples, Italy for me.",
+        ["weather", "naples"],
+    ),
+    # Mode-switch voice commands (translation e2e).
+    "cmd_translate": (
+        "From now on, please translate everything I say into English.",
+        ["translate"],
+    ),
+    "cmd_stop_translate": (
+        "Okay, stop translating now and go back to normal conversation.",
+        ["stop"],
+    ),
 }
 
 # Synthesis kwargs (see _synthesize) for base fixtures that need them.

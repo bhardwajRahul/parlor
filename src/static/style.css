@@ -316,6 +316,36 @@
     letter-spacing: 0.02em;
   }
 
+  /* Active session mode (translation) with its escape hatch */
+  .mode-chip {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 5px 8px 5px 14px;
+    border-radius: 100px;
+    background: var(--c-speak-dim);
+    color: var(--c-speak);
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+  }
+
+  .mode-chip[hidden] { display: none; }
+
+  .mode-stop {
+    font-family: var(--font-body);
+    font-size: 11px;
+    font-weight: 600;
+    padding: 3px 10px;
+    border: 1px solid rgba(129,140,248,0.25);
+    border-radius: 100px;
+    background: transparent;
+    color: var(--c-speak);
+    cursor: pointer;
+  }
+
+  .mode-stop:hover { background: rgba(129,140,248,0.15); }
+
   /* A background research task in flight (delegation) */
   .delegation-chip {
     align-self: flex-start;
@@ -331,6 +361,10 @@
   }
 
   .delegation-chip .loading-dots span { background: var(--c-process); }
+
+  /* Result ready but parked (e.g. waiting out translation mode) */
+  .delegation-chip.parked .loading-dots { display: none; }
+  .delegation-chip.parked { color: var(--c-listen); background: var(--c-listen-dim); }
 
   .loading-dots {
     display: inline-flex;

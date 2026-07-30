@@ -14,18 +14,24 @@ import util  # noqa: E402
 from conftest import MOCK_ANSWER  # noqa: E402
 
 
-def delegate_turn(session, fixture, tries=2):
+def delegate_turn(session, fixture):
     """Send a delegate-worthy utterance; at temperature 0.7 the model
-    occasionally acks without emitting the tag, so retry once. A
-    systematic recall regression still fails loudly — two consecutive
-    misses on a MUST-delegate ask is real, not noise."""
-    for _ in range(tries):
-        t = session.turn(util.audio(fixture))
+    occasionally acks without emitting the tag. The retry uses an
+    ALTERNATE phrasing ({fixture}_alt): re-sending identical audio tends
+    to reproduce the identical tagless completion (cached prefix), so
+    only different words give an independent sample. Two misses across
+    two phrasings of a MUST-delegate ask is a real regression."""
+    for name in (fixture, f"{fixture}_alt"):
+        t = session.turn(util.audio(name))
+        if t.marker == "incomplete":
+            # smart-turn held it: flush rather than re-speak, which would
+            # merge two copies of the utterance into one turn.
+            t = session.turn({"type": "flush"})
         started = session.wait_for("delegation_started", timeout=10)
         if started:
             return t, started
     raise AssertionError(
-        f"model never delegated {fixture!r} in {tries} tries — last ack {t.text!r}")
+        f"model never delegated {fixture!r} (either phrasing) — last ack {t.text!r}")
 
 
 def test_research_question_is_delegated_and_delivered(server, session, reasoner_mock):

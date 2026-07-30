@@ -191,6 +191,7 @@ function connect() {
     removePendingUserBubble();
     delegationChips.forEach(chip => chip.remove());  // tasks died with the server
     delegationChips.clear();
+    setSessionMode('conversation');  // a reconnect starts a fresh session
     clearFlushTimer();
     setStatus('disconnected', 'Disconnected');
     setTimeout(connect, 2000);
@@ -249,8 +250,19 @@ function connect() {
       }
       const meta = messagesDiv.querySelector('.msg.assistant:last-child .meta');
       if (meta) meta.textContent += ` · tts ${msg.tts_time}s`;
+    } else if (msg.type === 'mode_changed') {
+      setSessionMode(msg.mode);
     } else if (msg.type === 'delegation_started') {
       addDelegationChip(msg.id, msg.task);
+    } else if (msg.type === 'delegation_parked') {
+      // Finished, but delivery waits out translation mode — the chip must
+      // stop implying work in progress.
+      const chip = delegationChips.get(msg.id);
+      if (chip) {
+        chip.classList.add('parked');
+        chip.querySelector('.task').textContent =
+          'ready — ' + chip.querySelector('.task').textContent;
+      }
     } else if (msg.type === 'delegation_resolved') {
       // The delivery turn follows immediately as a normal spoken turn —
       // give it a fresh assistant bubble, and show it as thinking (which
@@ -288,6 +300,12 @@ function setAssistantMeta(text) {
     currentAssistantEl.appendChild(meta);
   }
   meta.textContent = text;
+}
+
+// ── Session mode (server-driven; the chip's stop button is the escape
+// hatch for when the spoken exit command gets mistranslated) ──
+function setSessionMode(mode) {
+  $('modeChip').hidden = mode !== 'translate';
 }
 
 // ── Delegation chips: a background research task in flight, shown until
@@ -675,6 +693,10 @@ function addMessage(role, text, meta) {
   messagesDiv.scrollTop = messagesDiv.scrollHeight;
   return div;
 }
+
+$('modeStop').addEventListener('click', () => {
+  wsSend({ type: 'set_mode', mode: 'conversation' });
+});
 
 cameraToggle.addEventListener('click', () => {
   cameraEnabled = !cameraEnabled;

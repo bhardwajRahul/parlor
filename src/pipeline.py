@@ -305,14 +305,16 @@ class StreamParser:
 # ── turn execution ────────────────────────────────────────────────────────
 
 # Spoken when a turn produced a control tag but no speech at all — an
-# action must never feel like the assistant ignored the user.
-TAG_ACK = "On it — I'll have that for you in a moment."
+# action must never feel like the assistant ignored the user. Generic on
+# purpose: it stands in for a delegation ack or a mode-switch confirmation.
+TAG_ACK = "Okay — one moment."
 
 
 async def run_turn(ws, messages: list, interrupted: asyncio.Event,
                    active: dict, tts_backend, expect_transcript: bool = True,
                    p_complete: float | None = None,
                    control_tags: tuple[str, ...] = (),
+                   tts_voice: str = "af_heart",
                    proactive: bool = False,
                    fallback: str | None = None) -> tuple[str, list]:
     """Stream one model turn: decode → sentences → TTS, all pipelined. The
@@ -357,7 +359,8 @@ async def run_turn(ws, messages: list, interrupted: asyncio.Event,
                 return
             if interrupted.is_set():
                 continue  # keep draining
-            pcm = await loop.run_in_executor(None, lambda s=sentence: tts_backend.generate(s))
+            pcm = await loop.run_in_executor(
+                None, lambda s=sentence: tts_backend.generate(s, voice=tts_voice))
             if interrupted.is_set():
                 continue
             if not audio_state["started"]:
@@ -416,7 +419,9 @@ async def run_turn(ws, messages: list, interrupted: asyncio.Event,
             # a control tag. Neither may end in silence — speak the ack or
             # the caller's fallback, and keep history coherent with what was
             # actually said.
-            say = TAG_ACK if parser.tags else fallback
+            # A proactive (delivery) turn always prefers its fallback: it IS
+            # the answer, and a stray tag must not replace it with an ack.
+            say = fallback if proactive else (TAG_ACK if parser.tags else fallback)
             if tts_started_at is None and say:
                 raw["text"] += "\n" + say
                 await dispatch([say])

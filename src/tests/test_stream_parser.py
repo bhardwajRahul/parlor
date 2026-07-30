@@ -272,6 +272,15 @@ def test_streaming_matches_batch_for_every_split_point_with_tags(text):
         assert run_tags([text[:i], text[i:]]) == batch, f"diverged at split {i}"
 
 
+def test_production_filter_knows_every_control_tag():
+    # The filter must ALWAYS be built with every tag name the prompts can
+    # incite: a name it doesn't know is released as speech, so a narrowed
+    # per-mode set would read task text aloud (found in review — modes must
+    # gate acting on tags, never parsing them).
+    import server
+    assert set(n.lower() for n in server.CONTROL_TAGS) == {"delegate", "mode"}
+
+
 def test_parser_without_control_tags_is_unchanged():
     # No control_tags configured → a delegate element is just text; the
     # ##-markup cut still applies to hash markup.

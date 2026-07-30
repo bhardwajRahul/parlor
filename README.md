@@ -38,6 +38,7 @@ Browser (playback + transcript)
 - **Speculative prefill during speech.** The camera frame is sent the moment you start speaking, and your speech itself streams to the server in ~3s chunks — both are pushed through llama.cpp's prompt cache while you're still talking, so at the end of a long question almost everything is already processed.
 - **Barge-in.** Interrupt the AI mid-sentence by speaking; generation is aborted server-side. Echo is handled without the browser's echo canceller (which muffles both the TTS voice and your barge-in on macOS): a sustained-speech gate plus a prompt rule — or just wear headphones.
 - **Background research delegation** (optional). Ask something that needs web search or real reasoning — "find the best pizza in Rome right now" — and the local model hands the task to a frontier model on any OpenAI-compatible endpoint (OpenRouter by default, with web search), keeps the conversation going, and speaks the answer when it comes back. Off unless `REASONER_API_KEY` is set; without it Parlor stays fully on-device.
+- **Live translation mode.** Say "translate everything I say into English" and Parlor becomes a consecutive interpreter: each utterance is rendered in English after a short silence window (no turn-completeness holds, no conversational replies), in any language Gemma understands. Say "stop translating" — or hit the stop chip — to return to conversation. One-way into English for now; the TTS voice is per-mode, so more Kokoro output languages are a config away.
 
 ## Requirements
 
@@ -127,6 +128,7 @@ src/
 ├── llama.py               # llama-server lifecycle + chat API client
 ├── pipeline.py            # Streaming turn pipeline (decode → sentences → TTS)
 ├── reasoner.py            # Background research delegation (OpenAI-compatible)
+├── modes.py               # Session modes (conversation, translate)
 ├── turn_detector.py       # smart-turn-v3 end-of-turn classifier
 ├── whisper_features.py    # Log-mel features for the turn detector
 ├── tts.py                 # Platform-aware TTS (MLX on Mac, ONNX on Linux)
