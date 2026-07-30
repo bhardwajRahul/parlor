@@ -225,10 +225,51 @@ def test_back_to_back_tags():
     assert tags == [("DELEGATE", "task one"), ("MODE", "translate target=en")]
 
 
-def test_streaming_matches_batch_for_every_split_point_with_tags():
-    batch = run_tags([DELEGATED])
-    for i in range(1, len(DELEGATED)):
-        assert run_tags([DELEGATED[:i], DELEGATED[i:]]) == batch, f"diverged at split {i}"
+def test_tolerant_spacing_still_extracts():
+    # '< delegate >' variants are the model reaching for the tag — firing
+    # the intended action beats suppressing it.
+    spoken, _, tags = run_tags(["###TRANSCRIPT: hi\n", "On it. ",
+                                "< delegate >find X</ delegate >"])
+    assert spoken == ["On it."]
+    assert tags == [("DELEGATE", "find X")]
+
+
+def test_value_may_contain_angle_bracket():
+    # 'flights under <$500' must not wedge the match: the close tag still
+    # terminates the value, and speech resumes after it.
+    spoken, _, tags = run_tags(["###TRANSCRIPT: hi\n", "Sure. ",
+                                "<delegate>flights under <$500</delegate>",
+                                " Give me a sec. "])
+    assert spoken == ["Sure.", "Give me a sec."]
+    assert tags == [("DELEGATE", "flights under <$500")]
+
+
+@pytest.mark.parametrize("markup", [
+    '<delegate task="find X">',   # attribute form
+    "<delegate/> find X",         # self-closing
+    "</delegate> find X",         # orphan close
+], ids=["attribute", "self-closing", "orphan-close"])
+def test_near_miss_markup_is_suppressed_not_spoken(markup):
+    # Names a control tag without being a clean element: model error —
+    # suppress from there on (like ## markup); the task text and anything
+    # after it must never reach TTS, and no action may fire.
+    spoken, _, tags = run_tags(["###TRANSCRIPT: hi\n", "On it. ", markup])
+    assert spoken == ["On it."]
+    assert tags == []
+
+
+@pytest.mark.parametrize("text", [
+    DELEGATED,
+    "###TRANSCRIPT: q\nOk. < delegate >find X</delegate> Done. ",
+    "###TRANSCRIPT: q\nOk. <delegate>a <$5 b</delegate> Done. ",
+    '###TRANSCRIPT: q\nOk. <delegate x="y">TASK never spoken. ',
+    "###TRANSCRIPT: q\nOk. </delegate> TASK never spoken. ",
+    "###TRANSCRIPT: q\nOk. 5 < 10 < 20 holds. <b>b</b>. ",
+], ids=["clean", "tolerant", "inner-lt", "attribute", "orphan", "literal"])
+def test_streaming_matches_batch_for_every_split_point_with_tags(text):
+    batch = run_tags([text])
+    for i in range(1, len(text)):
+        assert run_tags([text[:i], text[i:]]) == batch, f"diverged at split {i}"
 
 
 def test_parser_without_control_tags_is_unchanged():

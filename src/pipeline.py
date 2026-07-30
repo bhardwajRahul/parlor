@@ -121,31 +121,45 @@ async def release_client(ws) -> None:
 
 class TagFilter:
     """Streams response text through, extracting complete
-    '<name>value</name>' control elements into .tags and holding back any
-    suffix that may still become one. XML elements (not ###NAME: lines)
-    because the model emits them more reliably — benchmarks/tagbench.py
-    measured recall 0.667 vs 0.417 on E4B — and the explicit close tag
-    means a tag completes mid-stream and a half-streamed value can never
-    be extracted. Held text is released only once it turns out not to be
-    an element, so markup still open when the stream ends is never spoken
-    and never fires: a delegation with half its task is worse than none."""
+    '<name>value</name>' control elements into .tags. XML elements (not
+    ###NAME: lines) because the model emits them more reliably —
+    benchmarks/tagbench.py measured recall 0.667 vs 0.417 on E4B — and
+    the explicit close tag means a half-streamed value can never fire.
+
+    Parsed tolerantly ('< delegate >x</delegate>' extracts — firing the
+    intended action beats suppressing it) and the value may contain '<'
+    ('flights under <$500'); only the close tag terminates it. Anything
+    that names a control tag without being a clean element (a stray
+    '</delegate>', '<delegate x=1>') suppresses all further speech,
+    mirroring the ##-markup rule: it is model error, and speaking it —
+    task text included — is the worst outcome. Ordinary prose '<'
+    ('5 < 10') passes through. Markup still open when the stream ends is
+    dropped, never spoken and never fired: a delegation with half its
+    task is worse than none."""
 
     def __init__(self, names: tuple[str, ...]):
-        self._opens = [f"<{n.lower()}>" for n in names]
+        alt = "|".join(names)  # names are plain lowercase words
         self._re = re.compile(
-            r"<(?P<name>" + "|".join(names) + r")>\s*(?P<value>[^<]*?)\s*"
-            r"</(?P=name)>", re.IGNORECASE)
+            rf"<\s*(?P<name>{alt})\s*>\s*(?P<value>.*?)\s*<\s*/\s*(?P=name)\s*>",
+            re.IGNORECASE | re.DOTALL)
+        # A complete opening bracket: the element is committed, hold until
+        # its close tag (or end of stream) decides it.
+        self._open_re = re.compile(rf"^<\s*(?:{alt})\s*>", re.IGNORECASE)
+        # Names a control tag (with optional '/' and spacing) — but only
+        # consulted after _re and _open_re failed, so it is a near-miss.
+        self._miss_re = re.compile(rf"^<\s*/?\s*(?:{alt})\b", re.IGNORECASE)
+        # Too short to judge: '<', '</', '< dele' — letters (a name prefix)
+        # possibly followed by whitespace, still awaiting a decisive char.
+        self._forming_re = re.compile(r"^<[\s/]*([a-zA-Z]*)\s*$")
+        self._names = [n.lower() for n in names]
         self._held = ""
+        self._dead = False
         self.tags: list[tuple[str, str]] = []  # (NAME, value), stream order
-
-    def _viable(self, rest: str) -> bool:
-        """Could `rest` (starting at '<') still grow into, or already be
-        inside, a control element?"""
-        rest = rest.lower()
-        return any(o.startswith(rest) or rest.startswith(o) for o in self._opens)
 
     def feed(self, delta: str) -> str:
         """Returns the speakable text released by this delta."""
+        if self._dead:
+            return ""
         buf = self._held + delta
         self._held = ""
         out = []
@@ -160,12 +174,19 @@ class TagFilter:
                 self.tags.append((m.group("name").upper(), m.group("value").strip()))
                 out.append("\n")  # keep a boundary where the element sat
                 buf = buf[m.end():]
-            elif self._viable(buf[lt:]):
-                self._held = buf[lt:]
+                continue
+            rest = buf[lt:]
+            forming = self._forming_re.match(rest)
+            if self._open_re.match(rest) or (
+                    forming and any(n.startswith(forming.group(1).lower())
+                                    for n in self._names)):
+                self._held = rest  # a clean element may still complete
                 break
-            else:
-                out.append("<")  # literal '<', not ours
-                buf = buf[lt + 1:]
+            if self._miss_re.match(rest):
+                self._dead = True  # markup, not speech — nothing more is spoken
+                break
+            out.append("<")  # literal '<', not ours
+            buf = buf[lt + 1:]
         return "".join(out)
 
 
