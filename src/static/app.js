@@ -488,6 +488,12 @@ function stopPlayback() {
 }
 
 let ttsSink = null;    // MediaStreamDestination the TTS plays into
+let ttsOut = null;     // where TTS sources connect (sink, or raw destination)
+
+// '?raw-audio' bypasses the AEC media-element route: cleaner, consistent
+// output, but the mic will hear the assistant — headphones only. Useful to
+// A/B macOS voice-processing artifacts the AEC path can trigger.
+const RAW_AUDIO = new URLSearchParams(location.search).has('raw-audio');
 let ttsAudioEl = null; // hidden <audio> element that actually outputs it
 
 function ensureAudioCtx() {
@@ -501,6 +507,7 @@ function ensureAudioCtx() {
     // reference signal, so raw WebAudio output would be picked up by the
     // mic as "user speech" despite echoCancellation: true (crbug 687574).
     ttsSink = audioCtx.createMediaStreamDestination();
+    ttsOut = RAW_AUDIO ? audioCtx.destination : ttsSink;
     ttsAudioEl = document.createElement('audio');
     ttsAudioEl.srcObject = ttsSink.stream;
     ttsAudioEl.autoplay = true;
@@ -533,7 +540,7 @@ function queueAudioChunk(base64Pcm) {
 
   const source = audioCtx.createBufferSource();
   source.buffer = audioBuffer;
-  source.connect(ttsSink);
+  source.connect(ttsOut);
   source.connect(analyser);
 
   // Schedule gapless playback
