@@ -211,25 +211,25 @@ def judge_smart(detector, audio: np.ndarray, _b64: str) -> tuple[bool, float]:
     return complete, prob
 
 
-def judge_marker(server, _audio, b64: str) -> tuple[bool, float]:
+def judge_marker(_detector, _audio, b64: str) -> tuple[bool, float]:
     """Stopped after the marker token: the reply text costs the same
     whichever way the marker went, so decision latency is what turn-taking
     actually feels."""
     messages = [
         {"role": "system", "content": MARKER_SYSTEM_PROMPT},
         {"role": "user", "content": [
-            server.audio_part(b64), server.text_part(MARKER_INSTRUCTION)]},
+            pipeline.audio_part(b64), pipeline.text_part(MARKER_INSTRUCTION)]},
     ]
-    return _marker_verdict(server.chat_blocking(messages, max_tokens=8))
+    return _marker_verdict(llama.chat_blocking(messages, max_tokens=8))
 
 
-def judge_two_phase(server, _audio, b64: str) -> tuple[bool, float]:
+def judge_two_phase(_detector, _audio, b64: str) -> tuple[bool, float]:
     messages = [
         {"role": "system", "content": server.SYSTEM_PROMPT},
         {"role": "user", "content": [
-            server.audio_part(b64), server.text_part(DECISION_PROMPT)]},
+            pipeline.audio_part(b64), pipeline.text_part(DECISION_PROMPT)]},
     ]
-    return _marker_verdict(server.chat_blocking(messages, max_tokens=6))
+    return _marker_verdict(llama.chat_blocking(messages, max_tokens=6))
 
 
 def _marker_verdict(text: str) -> tuple[bool, float]:
@@ -292,16 +292,15 @@ def score_by_lang(results: list[dict]) -> dict:
     return {l: score([r for r in results if r["lang"] == l]) for l in langs}
 
 
-def run_mode(mode: str, clips: list[dict], server, detector) -> list[dict]:
+def run_mode(mode: str, clips: list[dict], detector) -> list[dict]:
     judge = JUDGES[mode]
-    ctx = detector if mode == "smart" else server
     results = []
     for i, clip in enumerate(clips, 1):
         raw = (CLIPS_DIR / f"{clip['id']}.wav").read_bytes()
         b64 = base64.b64encode(raw).decode()
-        audio = server.wav_to_float32(b64)
+        audio = pipeline.wav_to_float32(b64)
         t0 = time.time()
-        pred, prob = judge(ctx, audio, b64)
+        pred, prob = judge(detector, audio, b64)
         results.append({"id": clip["id"], "lang": clip["lang"],
                         "truth": clip["complete"], "pred": bool(pred),
                         "prob": round(prob, 3), "ms": (time.time() - t0) * 1000})
@@ -350,25 +349,27 @@ def main() -> None:
         os.environ["MMPROJ_PATH"] = hf_hub_download(repo, mmproj, local_files_only=True)
         os.environ["LLAMA_PORT"] = BENCH_PORT
 
-    import server  # after the env above; it reads LLAMA_PORT at import
+    global llama, pipeline, server  # after the env above; llama reads LLAMA_PORT at import
+    import llama
+    import pipeline
+    import server
     detector = None
     if "smart" in modes:
         from turn_detector import TurnDetector
         detector = TurnDetector()
     if set(modes) - {"smart"}:
-        server.start_llama_server()
+        llama.start()
 
     try:
         out = {"model": args.model, "langs": langs, "modes": {}}
         for mode in modes:
-            results = run_mode(mode, clips, server, detector)
+            results = run_mode(mode, clips, detector)
             out["modes"][mode] = {"stats": score(results),
                                   "by_lang": score_by_lang(results),
                                   "threshold_sweep": sweep_threshold(results),
                                   "results": results}
     finally:
-        if server.llama_proc:
-            server.llama_proc.terminate()
+        llama.stop()
 
     print()
     for mode in modes:

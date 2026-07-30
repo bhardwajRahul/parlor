@@ -1,13 +1,12 @@
 # Handoff: latency rebuild + llama.cpp port
 
-Branch: `perf-latency`. Everything below happened in one working session on
-2026-07-29; this doc is the state of the world, what is verified, and what
-still needs human testing. Delete this file before merging.
+Branch: `perf-latency`. This doc is the state of the world, what is verified,
+and what still needs human testing. Delete this file before merging.
 
 ## What changed (commit order tells the story)
 
 1. **E2E benchmark harness** (`src/benchmarks/`) — real synthesized speech
-   fixtures, perf + correctness suites, JSON results, `compare.py`.
+   fixtures, latency suite, JSON results, `compare.py`.
 2. **Streaming pipeline** — the `respond_to_user` tool call (which silently
    cost a second full inference round-trip per turn) replaced by streamed
    decoding: response sentences go to TTS while the model still generates,
@@ -23,10 +22,28 @@ still needs human testing. Delete this file before merging.
    classifier (~20ms CPU), and the LLM prompt carries no format instructions
    at all. The inline-marker and separate-request variants were measured
    (`benchmarks/turnbench.py`) at chance accuracy on E2B, E4B *and* 12B, so
-   `TURN_MODE` is gone and only the classifier path remains. The benchmark
-   still reproduces both variants against any future model.
-6. **Live-session fixes** — history poisoning by invalid audio, echo
-   parroting (AEC reference path + sustained-speech barge-in), capture leak.
+   only the classifier path remains.
+6. **Live-session quality fixes** (after quality regressions vs main were
+   reproduced with degraded fixtures):
+   - Audio that stops abruptly at the VAD cutoff makes the llama.cpp audio
+     encoder hallucinate a confident completion of the last word ("capital
+     of France?" clipped 180ms → "capital of the United States", answered
+     Washington). 300ms of silence appended INSIDE the final WAV fully
+     recovers the transcript. This was the main "transcript seems off /
+     answer seems wrong" failure mode at the 200ms VAD cutoff.
+   - False `incomplete` holds (e.g. other voices) left finished questions
+     unanswered. The canned nudge is replaced by a **flush**: after 2.5s of
+     continued silence the client asks the server to answer the held audio;
+     the model itself either answers or asks the user to continue.
+   - `temperature` 0 → 0.7: responses no longer repeat verbatim;
+     transcripts stay WER 0.0 on the clean fixtures.
+   - The transcript tag is parsed tolerantly (`### TRANSCRIPT:` with a
+     space was silently dropping correct transcripts).
+7. **Automated e2e suite** (`src/tests/`, `uv run pytest`) — covers
+   turn-taking, chunked overlap, camera grounding/freshness, transcript WER
+   (clean + degraded audio), memory, robustness (glitches, interrupts,
+   queued turns, rotation, llama-server death). 19 tests, ~1 min + model
+   load. `PARLOR_TEST_URL` runs it against a live server.
 
 ## Measured (M3 Pro, `benchmarks/results/`)
 
@@ -40,91 +57,57 @@ pre-session litert build.
 | Long question (9.4s speech) | 2.91s    | ~0.7-0.9s |
 | Long + camera               | 2.98s    | ~0.8-1.0s |
 
-All bench correctness checks pass except `thinking_suppressed` (see Known
-limitations). Reproduce: `uv run server.py`, then
+Reproduce: `uv run server.py`, then
 `uv run python benchmarks/bench.py --label X --out benchmarks/results/X.json`.
 
-## Test checklist
+## Manual test checklist (what pytest cannot judge)
 
 Run with logs captured: `uv run python server.py 2>&1 | tee /tmp/parlor.log`.
 Hard-refresh the browser (Cmd+Shift+R) after every server restart.
 
-### A. Turn-taking (the part benchmarks cannot judge — real prosody)
+### A. Turn-taking feel (real prosody, real mic)
 
 - [ ] Finish a sentence cleanly → response starts in well under a second.
 - [ ] Trail off mid-sentence ("So what I wanted to ask is…") → stays quiet,
-      log shows `p(complete)` near 0, gentle nudge after ~5s of silence.
+      log shows `p(complete)` near 0; ~2.5s later the flush turn arrives and
+      the model asks you to continue (not a canned line).
 - [ ] "Hmm, let me think about that…" with genuine hesitation tone → stays
       quiet. **Watch the `p(complete)` values** — if your speaking style
       lands on the wrong side, the 0.5 threshold in `turn_detector.py` is
       the tuning knob.
 - [ ] Continue after an incomplete pause → the eventual answer accounts for
-      BOTH parts of your utterance, and the transcript shows the whole thing.
-- [ ] Nudges stop after 2 (it must not pester an empty room).
-- [ ] Natural fast back-and-forth conversation feels right at 200ms VAD; if
-      it clips you, `redemptionMs` in index.html.
+      BOTH parts, and the transcript shows the whole thing.
+- [ ] Natural fast back-and-forth feels right at 200ms VAD; if it clips
+      you, `redemptionMs` in static/app.js.
 
-### B. Speech overlap (long utterances)
+### B. Echo and barge-in (browser + speakers)
 
-- [ ] Ask an 8-10s question → `Primed cache (...)` lines appear WHILE you
-      talk, and the response starts about as fast as for a short question.
-- [ ] If no `Primed cache` lines appear during speech, the vad-web
-      `onFrameProcessed` fallback kicked in — chunk streaming is silently
-      off. Report the vad-web version.
-- [ ] Transcript of a long chunked utterance is verbatim-accurate (this is
-      the chunk-boundary integrity check).
-
-### C. Echo and barge-in
-
-- [ ] Speakers at normal volume: the assistant must never answer its own
-      voice (the parrot bug). Check `heard:` lines for its own phrasings.
-- [ ] Speakers loud: same. (Three layers should hold: AEC via the media
-      element, 250ms sustained-speech gate, echo rule in the prompt.)
-- [ ] Deliberate barge-in mid-reply: it stops within a beat (~250ms of you
-      speaking) and handles what you said next.
+- [ ] Speakers at normal volume: never answers its own voice (check
+      `heard:` lines for its own phrasings).
+- [ ] Speakers loud: same. (Three layers: AEC via the media element, 250ms
+      sustained-speech gate, echo rule in the prompt.)
+- [ ] Deliberate barge-in mid-reply: stops within a beat and handles what
+      you said next.
 - [ ] Barge-in within the first ~800ms of it speaking is intentionally
       ignored (echo grace period) — confirm that feels okay.
 
-### D. Camera
+### C. Quality (the original complaint — judge vs main by feel)
 
-- [ ] Ask about what it sees → grounded, correct description.
-- [ ] Move/change the scene between turns → it references the NEW scene
-      (frame freshness; the frame is captured at speech start).
-- [ ] Camera toggled off → conversation still works, no "with camera" label.
-- [ ] A cough/misfire followed by a real question → fresh frame, not stale.
-
-### E. Robustness
-
-- [ ] Coughs, taps, mic bumps → no error cascade, session keeps working
-      (the old failure mode was a poisoned history requiring reload).
-- [ ] Talk while it's still processing the previous turn → queued, handled.
-- [ ] Reload the page mid-reply → reconnects, fresh conversation, works.
-- [ ] Long session (15+ camera exchanges) → context rotation kicks in
-      ("dropping N oldest messages" in log) and the session survives it.
-- [ ] Kill llama-server manually → next turn fails gracefully (client
-      returns to listening), and a server restart recovers.
-
-### F. Quality (the original complaint)
-
-- [ ] Responses feel at least as good as the pre-worktree version — the
-      marker instructions are gone from the prompt, which was the main
-      suspected quality tax.
-- [ ] Transcripts accurate enough to be pedagogically useful.
-- [ ] Multi-turn memory: reference something from a few turns back.
+- [ ] Transcripts of YOUR real voice are accurate, including the last word
+      of each utterance (the padding fix targets exactly this).
+- [ ] Responses feel at least as good as main. If not: try E4B via
+      `MODEL_PATH`/`MMPROJ_PATH` (unsloth/gemma-4-E4B-it-GGUF) — roughly 2x
+      latency.
 - [ ] **Multilingual** (the Bule-AI use case): speak Indonesian or another
-      language → understanding and transcript quality. Note: Kokoro TTS
-      voice `af_heart` is English; non-English TTS output is a known gap.
+      language → understanding and transcript quality. Kokoro voice
+      `af_heart` is English; non-English TTS output is a known gap.
       smart-turn-v3 is trained on 23 languages, but verify turn-taking
       feels right in non-English speech.
-- [ ] If quality is still lacking: try E4B via
-      `MODEL_PATH`/`MMPROJ_PATH` (unsloth/gemma-4-E4B-it-GGUF) — expect
-      roughly 2x latency.
 
-### G. Platforms (untested — needs hardware)
+### D. Platforms (untested — needs hardware)
 
-- [ ] **Linux**: llama.cpp must be installed manually (no brew); TTS falls
-      back to kokoro-onnx; `onnxruntime` and vad-web CDN paths. Entirely
-      unverified.
+- [ ] **Linux**: llama.cpp installed manually (no brew); TTS falls back to
+      kokoro-onnx; `onnxruntime` and vad-web CDN paths. Entirely unverified.
 - [ ] Safari / Firefox: vad-web, the AEC media-element routing, and audio
       autoplay policies all behave differently. Chrome is the only tested
       browser.
@@ -132,18 +115,16 @@ Hard-refresh the browser (Cmd+Shift+R) after every server restart.
 
 ## Known limitations / accepted trade-offs
 
-- `thinking_suppressed` bench check fails **by construction**: the fixture is
-  TTS-synthesized with finished-sounding falling prosody, and the acoustic
-  classifier (correctly) reads the acoustics. Real hesitation is what it is
-  trained on — judge from live testing, not this fixture.
 - Image-only turns sometimes invent a "transcript" of the instruction text
   (cosmetic; real clients always send audio).
-- llama-server output goes to DEVNULL; un-silence in `start_llama_server()`
-  when debugging.
+- llama-server output goes to DEVNULL; un-silence in `llama.py` when
+  debugging.
 - llama.cpp marks Gemma audio input "experimental stage".
-- Temperature is 0 (deterministic): nudge phrasing repeats verbatim.
 - Context-size guard uses a token *estimate* (`estimate_tokens`), not exact
   counts.
+- The `thinking_pause` fixture cannot test hesitation: TTS gives it
+  finished-sounding prosody, which the acoustic classifier correctly reads
+  as complete (skipped test documents this). Judge from live speech.
 
 ## Upstream issues worth filing
 

@@ -33,7 +33,7 @@ Browser (playback + transcript)
 ```
 
 - **Voice Activity Detection** in the browser ([Silero VAD](https://github.com/ricky0123/vad)). Hands-free, no push-to-talk, with a short 200ms silence cutoff for fast turn-taking.
-- **Turn-completeness filtering.** Gemma judges every utterance (`FINISHED` / `WAIT`) before answering — if you were cut off mid-sentence or paused to think, it stays quiet and lets you continue, then gently nudges you if you go silent. (Same idea as [Pipecat's incomplete-turn filtering](https://docs.pipecat.ai/api-reference/server/utilities/turn-management/filter-incomplete-turns).)
+- **Turn-completeness filtering.** Pipecat's [smart-turn-v3](https://huggingface.co/pipecat-ai/smart-turn-v3) audio classifier (~20ms on CPU) judges whether you finished your thought before the LLM answers — if you were cut off or paused to think, it stays quiet and lets you continue. If you then stay silent, the held audio is flushed to the model, which either answers it or warmly asks you to finish.
 - **Streaming decode → TTS.** The response is spoken sentence-by-sentence while the model is still generating, and the transcript is generated last so it never delays audio.
 - **Speculative prefill during speech.** The camera frame is sent the moment you start speaking, and your speech itself streams to the server in ~3s chunks — both are pushed through llama.cpp's prompt cache while you're still talking, so at the end of a long question almost everything is already processed.
 - **Barge-in.** Interrupt the AI mid-sentence by speaking; generation is aborted server-side.
@@ -71,6 +71,7 @@ Models are downloaded automatically on first run (~4 GB for Gemma 4 E2B QAT + it
 | `MODEL_PATH`       | auto-download from HuggingFace | Path to a local Gemma 4 `.gguf` file           |
 | `MMPROJ_PATH`      | auto-download from HuggingFace | Path to the matching `mmproj` `.gguf` (audio + vision encoders) |
 | `PORT`             | `8000`                         | Server port                                    |
+| `TEMPERATURE`      | `0.7`                          | Sampling temperature (0 = deterministic)       |
 | `LLAMA_CTX`        | `16384`                        | llama.cpp context size. The server drops the oldest exchanges shortly before it fills |
 | `LLAMA_PORT`       | `8081`                         | Port for the spawned llama-server              |
 | `LLAMA_SERVER_URL` | (spawn our own)                | Use an already-running llama-server instead    |
@@ -96,27 +97,49 @@ uv run python benchmarks/bench.py --label after --out benchmarks/results/after.j
 uv run python benchmarks/compare.py benchmarks/results/before.json benchmarks/results/after.json
 ```
 
+## Testing
+
+An end-to-end suite spawns the real server (llama.cpp, TTS, turn detector)
+and drives it over WebSocket with synthesized speech — including degraded
+audio (clipped word endings, noise, other voices) that reproduces live-mic
+failure modes:
+
+```bash
+uv run pytest            # ~1 minute + model load
+```
+
+Set `PARLOR_TEST_URL=ws://localhost:8000/ws` to run it against an
+already-running server. Browser-only behavior (echo cancellation, VAD feel,
+multilingual speech) still needs the manual checklist in `HANDOFF.md`.
+
 ## Project structure
 
 ```
 src/
-├── server.py              # FastAPI WebSocket server + Gemma 4 inference
+├── server.py              # FastAPI app + per-connection conversation loop
+├── llama.py               # llama-server lifecycle + chat API client
+├── pipeline.py            # Streaming turn pipeline (decode → sentences → TTS)
+├── turn_detector.py       # smart-turn-v3 end-of-turn classifier
+├── whisper_features.py    # Log-mel features for the turn detector
 ├── tts.py                 # Platform-aware TTS (MLX on Mac, ONNX on Linux)
-├── index.html             # Frontend UI (VAD, camera, audio playback)
-├── pyproject.toml         # Dependencies
+├── index.html             # Frontend markup
+├── static/                # Frontend styles + app logic (VAD, camera, playback)
+├── tests/                 # End-to-end test suite (uv run pytest)
 └── benchmarks/
-    ├── bench.py           # End-to-end perf + correctness benchmark
-    ├── fixtures.py        # Spoken-audio test fixtures (synthesized locally)
+    ├── bench.py           # End-to-end latency benchmark
+    ├── fixtures.py        # Spoken-audio fixtures (synthesized locally)
     ├── compare.py         # Diff two benchmark result files
-    └── benchmark_tts.py   # TTS backend comparison
+    ├── turnbench.py       # Turn-detection accuracy benchmark
+    └── experiment_*.py    # Recorded dead ends (see commit messages)
 ```
 
 ## Acknowledgments
 
 - [Gemma 4](https://ai.google.dev/gemma) by Google DeepMind
-- [LiteRT-LM](https://github.com/google-ai-edge/LiteRT-LM) by Google AI Edge
+- [llama.cpp](https://github.com/ggml-org/llama.cpp) by Georgi Gerganov and contributors
 - [Kokoro](https://huggingface.co/hexgrad/Kokoro-82M) TTS by Hexgrad
 - [Silero VAD](https://github.com/snakers4/silero-vad) for browser voice activity detection
+- [smart-turn-v3](https://huggingface.co/pipecat-ai/smart-turn-v3) end-of-turn detection by Pipecat
 
 ## License
 
