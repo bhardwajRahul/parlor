@@ -1,0 +1,361 @@
+"""The streaming turn pipeline: message-content helpers, the incremental
+response/transcript parser, and run_turn (decode → sentences → TTS, all
+pipelined), plus speculative cache priming."""
+
+import asyncio
+import base64
+import io
+import json
+import re
+import time
+import wave
+
+import numpy as np
+
+import llama
+
+# Parsed tolerantly ("### TRANSCRIPT : ..." happens) — but the colon is
+# REQUIRED and only [ \t] may follow: this regex runs against a partially
+# streamed buffer, so an optional colon matches before the ":" token
+# arrives (leaking it into the transcript) and \s* would let a newline
+# delta terminate an empty transcript line.
+TRANSCRIPT_TAG_RE = re.compile(r"#{2,}[ \t]*TRANSCRIPT[ \t]*:[ \t]*", re.IGNORECASE)
+SENTENCE_END_RE = re.compile(r"[.!?]+\s")
+MAX_OUTPUT_TOKENS = 256
+
+# Appended (inside the final WAV) before the LLM sees the utterance: audio
+# that stops abruptly at the VAD cutoff makes the encoder hallucinate a
+# confident completion of the last word; a beat of silence fixes it.
+TAIL_SILENCE_S = 0.3
+
+# Rough per-part token costs for the context-rotation estimate.
+AUDIO_TOKENS_PER_SEC = 32
+IMAGE_TOKENS = 300
+
+_DONE = object()
+
+
+# ── message content ───────────────────────────────────────────────────────
+
+def image_part(b64: str) -> dict:
+    return {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + b64}}
+
+
+def audio_part(b64: str) -> dict:
+    return {"type": "input_audio", "input_audio": {"data": b64, "format": "wav"}}
+
+
+def text_part(text: str) -> dict:
+    return {"type": "text", "text": text}
+
+
+def valid_audio(b64: str | None) -> bool:
+    """At least ~100ms of 16kHz s16 WAV — llama-server 400s on empty audio,
+    and one bad message in history would poison every later request."""
+    return bool(b64) and len(b64) * 3 // 4 > 44 + 3200
+
+
+def user_content(image_b64: str | None, audio_b64s: list[str]) -> list:
+    """Media parts of the current user turn, in canonical (cache-stable)
+    order: image first, then audio segments oldest-to-newest."""
+    parts = [image_part(image_b64)] if image_b64 else []
+    parts += [audio_part(b) for b in audio_b64s]
+    return parts
+
+
+def estimate_tokens(messages: list) -> int:
+    total = 0
+    for m in messages:
+        content = m.get("content")
+        if isinstance(content, str):
+            total += len(content) // 4 + 8
+            continue
+        for p in content:
+            if p["type"] == "text":
+                total += len(p["text"]) // 4
+            elif p["type"] == "input_audio":
+                wav_bytes = len(p["input_audio"]["data"]) * 3 // 4
+                total += (wav_bytes // 32000) * AUDIO_TOKENS_PER_SEC  # 16kHz s16
+            else:
+                total += IMAGE_TOKENS
+        total += 8
+    return total
+
+
+def wav_to_float32(b64: str) -> np.ndarray:
+    with wave.open(io.BytesIO(base64.b64decode(b64)), "rb") as w:
+        pcm = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
+    return pcm.astype(np.float32) / 32768.0
+
+
+def pad_tail_silence(b64: str) -> str:
+    """Append TAIL_SILENCE_S of silence inside the WAV. Must be in the same
+    WAV as the speech — a separate silence part doesn't stop the encoder
+    hallucinating a completion of an abruptly-cut last word."""
+    with wave.open(io.BytesIO(base64.b64decode(b64)), "rb") as w:
+        params = w.getparams()
+        frames = w.readframes(w.getnframes())
+    frames += b"\x00" * (params.sampwidth * params.nchannels
+                         * int(TAIL_SILENCE_S * params.framerate))
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as out:
+        out.setparams(params)
+        out.writeframes(frames)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+# ── websocket protocol ────────────────────────────────────────────────────
+
+async def send_json(ws, payload: dict) -> None:
+    await ws.send_text(json.dumps(payload))
+
+
+async def release_client(ws) -> None:
+    """Terminal frame for a turn that produced nothing. Without it the client
+    sits in 'processing' until its watchdog fires."""
+    await send_json(ws, {"type": "turn_final", "transcription": None,
+                         "timings": {}, "spoke": False})
+
+
+# ── streaming turn parser ─────────────────────────────────────────────────
+
+class StreamParser:
+    """Incrementally parses '###TRANSCRIPT: <words>\\n<response>'.
+
+    The transcript line LEADS: the model commits to what it heard before
+    answering. Generating it after the response instead makes it a
+    paraphrase from memory — measured WER 0.39 vs 0.00 on a clean 33-word
+    utterance — and the leading line lets the client show what was heard
+    while the response is still decoding.
+
+    feed() returns complete response sentences as they become available
+    (transcript-line deltas return none); finalize() returns the trailing
+    partial sentence and the transcript. With expect_transcript=False
+    (text/image turns) the reply streams directly and any imitated
+    trailing tag is cut, never spoken.
+    """
+
+    def __init__(self, expect_transcript: bool = True):
+        self.response = ""
+        self.transcript: str | None = None
+        self._awaiting = expect_transcript
+        self._got_tag = False
+        self._buf = ""
+        self._before_tag = ""  # stray text before the tag → response prefix
+        self._emitted = 0
+
+    def feed(self, delta: str) -> list[str]:
+        if self._awaiting:
+            self._buf += delta
+            if not self._got_tag:
+                m = TRANSCRIPT_TAG_RE.search(self._buf)
+                if not m:
+                    return []
+                self._got_tag = True
+                self._before_tag = self._buf[:m.start()]
+                self._buf = self._buf[m.end():]
+            # A leading "\n" delta must not terminate an empty transcript.
+            self._buf = self._buf.lstrip()
+            newline = self._buf.find("\n")
+            if newline == -1:
+                if len(self._buf) < 600:
+                    return []
+                # Runaway transcript line: take the first sentence and stream
+                # the rest, rather than holding TTS hostage.
+                m = SENTENCE_END_RE.search(self._buf)
+                newline = m.end() - 1 if m else len(self._buf) - 1
+            self.transcript = self._buf[:newline].strip() or None
+            self.response = (self._before_tag + self._buf[newline + 1:]).lstrip()
+            self._awaiting = False
+            self._buf = ""
+        else:
+            self.response += delta
+        return self._complete_sentences()
+
+    def _complete_sentences(self) -> list[str]:
+        # The model occasionally imitates tag-like "##…" markup — never
+        # speak anything from one onwards.
+        end = len(self.response)
+        hash_pos = self.response.find("##", self._emitted)
+        if hash_pos != -1:
+            end = min(end, hash_pos)
+        sentences = []
+        while True:
+            m = SENTENCE_END_RE.search(self.response, self._emitted, end)
+            if not m:
+                break
+            sentence = self.response[self._emitted:m.end()].strip()
+            self._emitted = m.end()
+            if sentence:
+                sentences.append(sentence)
+        return sentences
+
+    def finalize(self) -> tuple[list[str], str | None]:
+        if self._awaiting:
+            if self._got_tag:
+                # No newline ever arrived (truncated stream / model ran the
+                # reply onto the tag line): first sentence is the transcript,
+                # the rest is the reply — never swallow it all silently.
+                m = SENTENCE_END_RE.search(self._buf)
+                cut = m.end() if m else len(self._buf)
+                self.transcript = self._buf[:cut].strip() or None
+                self.response = self._before_tag + self._buf[cut:]
+            else:
+                self.response = self._buf
+            self._awaiting = False
+        sentences = self._complete_sentences()
+        # Cut any imitated tag markup — never speak it.
+        tail = re.split(r"#{2,}", self.response[self._emitted:])[0].strip()
+        return sentences + ([tail] if tail else []), self.transcript
+
+
+# ── turn execution ────────────────────────────────────────────────────────
+
+async def run_turn(ws, messages: list, interrupted: asyncio.Event,
+                   active: dict, tts_backend, expect_transcript: bool = True,
+                   p_complete: float | None = None,
+                   fallback: str | None = None) -> str:
+    """Stream one model turn: decode → sentences → TTS, all pipelined. The
+    transcript line is pushed to the client the moment it completes, while
+    the response is still decoding. Returns the raw generated text (stored
+    verbatim in history so the next request gets a full prefix-cache hit)."""
+    loop = asyncio.get_event_loop()
+    t0 = time.time()
+    timings: dict = {}
+
+    chunk_q: asyncio.Queue = asyncio.Queue()
+    stream = llama.ChatStream(messages, MAX_OUTPUT_TOKENS)
+    active["stream"] = stream
+    raw = {"text": ""}
+
+    def produce():
+        try:
+            def on_delta(text):
+                raw["text"] += text
+                loop.call_soon_threadsafe(chunk_q.put_nowait, text)
+            stream.run(on_delta)
+            loop.call_soon_threadsafe(chunk_q.put_nowait, _DONE)
+        except Exception as e:  # surfaced to the consumer loop
+            loop.call_soon_threadsafe(chunk_q.put_nowait, e)
+
+    producer = loop.run_in_executor(None, produce)
+
+    sentence_q: asyncio.Queue = asyncio.Queue()
+    audio_state = {"started": False, "first_audio_at": None, "chunks": 0}
+
+    async def tts_worker():
+        while True:
+            sentence = await sentence_q.get()
+            if sentence is _DONE:
+                return
+            if interrupted.is_set():
+                continue  # keep draining
+            pcm = await loop.run_in_executor(None, lambda s=sentence: tts_backend.generate(s))
+            if interrupted.is_set():
+                continue
+            if not audio_state["started"]:
+                audio_state["started"] = True
+                audio_state["first_audio_at"] = time.time()
+                await send_json(ws, {"type": "audio_start",
+                                     "sample_rate": tts_backend.sample_rate})
+            pcm_int16 = (pcm * 32767).clip(-32768, 32767).astype(np.int16)
+            await send_json(ws, {
+                "type": "audio_chunk",
+                "audio": base64.b64encode(pcm_int16.tobytes()).decode(),
+                "index": audio_state["chunks"],
+            })
+            audio_state["chunks"] += 1
+
+    tts_task = asyncio.create_task(tts_worker())
+    parser = StreamParser(expect_transcript)
+    tts_started_at = None
+    transcript_sent = False
+
+    async def dispatch(sentences: list[str]):
+        nonlocal tts_started_at
+        for sentence in sentences:
+            if tts_started_at is None:
+                tts_started_at = time.time()
+            await send_json(ws, {"type": "text_delta", "text": sentence + " "})
+            sentence_q.put_nowait(sentence)
+
+    try:
+        while True:
+            item = await chunk_q.get()
+            if item is _DONE:
+                break
+            if isinstance(item, Exception):
+                raise item
+            if "prefill_s" not in timings:
+                timings["prefill_s"] = round(time.time() - t0, 3)
+            if not interrupted.is_set():
+                await dispatch(parser.feed(item))
+                if parser.transcript and not transcript_sent:
+                    transcript_sent = True
+                    timings["transcript_s"] = round(time.time() - t0, 3)
+                    await send_json(ws, {"type": "transcript",
+                                         "transcription": parser.transcript,
+                                         "p_complete": p_complete})
+
+        tail, transcript = parser.finalize()
+        timings["llm_time"] = round(time.time() - t0, 3)
+        timings["decode_s"] = round(timings["llm_time"] - timings.get("prefill_s", 0), 3)
+
+        if not interrupted.is_set():
+            await dispatch(tail)
+            if fallback and tts_started_at is None:
+                # The model emitted only a transcript line (models of every
+                # size sometimes do this for cut-off audio) — a flush turn
+                # must never end in silence, so speak the fallback and keep
+                # history coherent with what was actually said.
+                raw["text"] += "\n" + fallback
+                await dispatch([fallback])
+    finally:
+        active["stream"] = None
+        sentence_q.put_nowait(_DONE)
+        try:
+            await tts_task
+        finally:
+            # The producer thread must be done before anyone reuses the slot.
+            await producer
+
+    if audio_state["first_audio_at"]:
+        timings["ttfa_s"] = round(audio_state["first_audio_at"] - t0, 3)
+    if tts_started_at:
+        timings["tts_time"] = round(time.time() - tts_started_at, 3)
+
+    print(
+        f"LLM ({timings['llm_time']:.2f}s, prefill {timings.get('prefill_s')}s) "
+        f"heard: {transcript!r} → {parser.response.strip()!r}"
+    )
+
+    if interrupted.is_set():
+        print("Interrupted mid-turn")
+        return raw["text"]
+
+    await send_json(ws, {
+        "type": "turn_final",
+        "transcription": transcript,
+        "timings": timings,
+        "p_complete": p_complete,
+        "spoke": audio_state["started"],  # False → client must not wait for audio_end
+    })
+    if audio_state["started"]:
+        await send_json(ws, {"type": "audio_end",
+                             "tts_time": timings.get("tts_time", 0)})
+    return raw["text"]
+
+
+async def prime_cache(messages: list) -> None:
+    """Fire-and-discard request that pushes a prompt prefix (camera frame,
+    speech chunks) through llama-server's cache while the user is talking.
+    Content must be media-only appends — a trailing text block would diverge
+    the prefix and kill reuse. Failure is not worth reporting: the turn still
+    works, it just pays full prefill."""
+    t0 = time.time()
+    try:
+        await asyncio.get_event_loop().run_in_executor(
+            None, lambda: llama.chat_blocking(messages, max_tokens=1))
+        print(f"Primed cache ({time.time() - t0:.2f}s)")
+    except Exception as e:
+        print(f"Cache priming failed: {e}")
