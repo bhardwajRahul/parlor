@@ -212,7 +212,9 @@ class StreamParser:
 # ── turn execution ────────────────────────────────────────────────────────
 
 async def run_turn(ws, messages: list, interrupted: asyncio.Event,
-                   active: dict, tts_backend, expect_transcript: bool = True) -> str:
+                   active: dict, tts_backend, expect_transcript: bool = True,
+                   p_complete: float | None = None,
+                   fallback: str | None = None) -> str:
     """Stream one model turn: decode → sentences → TTS, all pipelined. The
     transcript line is pushed to the client the moment it completes, while
     the response is still decoding. Returns the raw generated text (stored
@@ -292,7 +294,8 @@ async def run_turn(ws, messages: list, interrupted: asyncio.Event,
                     transcript_sent = True
                     timings["transcript_s"] = round(time.time() - t0, 3)
                     await send_json(ws, {"type": "transcript",
-                                         "transcription": parser.transcript})
+                                         "transcription": parser.transcript,
+                                         "p_complete": p_complete})
 
         tail, transcript = parser.finalize()
         timings["llm_time"] = round(time.time() - t0, 3)
@@ -300,6 +303,13 @@ async def run_turn(ws, messages: list, interrupted: asyncio.Event,
 
         if not interrupted.is_set():
             await dispatch(tail)
+            if fallback and tts_started_at is None:
+                # The model emitted only a transcript line (models of every
+                # size sometimes do this for cut-off audio) — a flush turn
+                # must never end in silence, so speak the fallback and keep
+                # history coherent with what was actually said.
+                raw["text"] += "\n" + fallback
+                await dispatch([fallback])
     finally:
         active["stream"] = None
         sentence_q.put_nowait(_DONE)
@@ -327,6 +337,7 @@ async def run_turn(ws, messages: list, interrupted: asyncio.Event,
         "type": "turn_final",
         "transcription": transcript,
         "timings": timings,
+        "p_complete": p_complete,
         "spoke": audio_state["started"],  # False → client must not wait for audio_end
     })
     if audio_state["started"]:

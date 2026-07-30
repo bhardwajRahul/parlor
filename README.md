@@ -41,7 +41,7 @@ Browser (playback + transcript)
 ## Requirements
 
 - Python 3.12+
-- [llama.cpp](https://github.com/ggml-org/llama.cpp) (`brew install llama.cpp` on macOS)
+- [llama.cpp](https://github.com/ggml-org/llama.cpp) (`brew install llama.cpp` on macOS; other platforms: [install guide](https://github.com/ggml-org/llama.cpp/blob/master/docs/install.md))
 - macOS with Apple Silicon, or Linux with a supported GPU
 - ~6 GB free RAM for the default E4B model (`MODEL=e2b` fits in ~4 GB)
 

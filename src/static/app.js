@@ -192,23 +192,25 @@ function connect() {
       // Keep the pending bubble: the held audio is still this utterance,
       // and the eventual merged transcript will fill it.
       serverHoldingAudio = true;
+      const held = pendingUserBubble();
+      if (held) setBubbleMeta(held, `paused · finished ${Math.round((msg.p_complete ?? 0) * 100)}%`);
       goListening();
       startFlushTimer();
     } else if (msg.type === 'transcript') {
       // The transcript line leads the model's reply, so what you said
       // appears while the response is still decoding.
       if (ignoreIncomingAudio) return;
-      fillUserBubble(msg.transcription);
+      fillUserBubble(msg.transcription, msg.p_complete);
     } else if (msg.type === 'turn_final') {
       if (ignoreIncomingAudio) return;
       if (!msg.spoke && !msg.transcription) {
         removeLastUserLoading();  // glitch/empty turn — nothing was heard
       } else {
-        fillUserBubble(msg.transcription);
+        fillUserBubble(msg.transcription, msg.p_complete);
       }
       const t = msg.timings || {};
       if (t.llm_time) {
-        setAssistantMeta(`LLM ${t.llm_time}s` + (t.ttfa_s ? ` · audio @ ${t.ttfa_s}s` : ''));
+        setAssistantMeta((t.ttfa_s ? `first audio ${t.ttfa_s}s · ` : '') + `model ${t.llm_time}s`);
       }
       if (!msg.spoke) goListening();  // no audio will follow
     } else if (msg.type === 'audio_start') {
@@ -226,7 +228,7 @@ function connect() {
         return;
       }
       const meta = messagesDiv.querySelector('.msg.assistant:last-child .meta');
-      if (meta) meta.textContent += ` · TTS ${msg.tts_time}s`;
+      if (meta) meta.textContent += ` · tts ${msg.tts_time}s`;
     }
   };
 }
@@ -271,20 +273,34 @@ function removeLastUserLoading() {
 }
 
 // One pending bubble per utterance-group: a continuation after a hold (or a
-// flush) belongs to the same bubble the first segment created.
+// flush) belongs to the same bubble the first segment created. The base
+// meta ('with camera') is kept in dataset so later info can extend it.
 function addUserLoadingBubble(meta) {
-  if (!pendingUserBubble()) addMessage('user', LOADING_DOTS, meta);
+  if (pendingUserBubble()) return;
+  addMessage('user', LOADING_DOTS, meta);
+  messagesDiv.lastElementChild.dataset.base = meta || '';
 }
 
-// Replace the last user bubble's loading dots with the heard words (no-op if
-// already filled — the early 'transcript' frame wins over turn_final's copy).
-function fillUserBubble(transcription) {
-  const userMsgs = messagesDiv.querySelectorAll('.msg.user');
-  const last = userMsgs[userMsgs.length - 1];
-  if (last && last.querySelector('.loading-dots')) {
-    const meta = last.querySelector('.meta');
-    last.innerHTML = `${transcription || '…'}${meta ? meta.outerHTML : ''}`;
+function setBubbleMeta(bubble, extra) {
+  const parts = [bubble.dataset.base, extra].filter(Boolean);
+  let meta = bubble.querySelector('.meta');
+  if (!parts.length) { if (meta) meta.remove(); return; }
+  if (!meta) {
+    meta = document.createElement('div');
+    meta.className = 'meta';
+    bubble.appendChild(meta);
   }
+  meta.textContent = parts.join(' · ');
+}
+
+// Replace the last user bubble's loading dots with the heard words plus the
+// turn detector's confidence (no-op if already filled — the early
+// 'transcript' frame wins over turn_final's copy).
+function fillUserBubble(transcription, pComplete) {
+  const bubble = pendingUserBubble();
+  if (!bubble) return;
+  bubble.textContent = transcription || '…';
+  setBubbleMeta(bubble, pComplete != null ? `finished ${Math.round(pComplete * 100)}%` : '');
 }
 
 // ── Flush timer: an incomplete turn went quiet — have the model answer the

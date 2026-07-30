@@ -66,6 +66,10 @@ RESPOND_PROMPT = (
     "to them: 1-4 short sentences, spoken aloud.{camera}"
 )
 
+# Spoken when a flush turn yields no reply at all — silence is the one
+# outcome a flush must never have.
+FLUSH_FALLBACK = "Take your time — I'm listening."
+
 # A "flush" turn: the classifier judged the utterance unfinished, the user
 # then stayed silent, so answer what we have — the model decides whether it
 # is answerable or needs encouragement to continue. Dedicated prompt: with
@@ -206,6 +210,7 @@ async def websocket_endpoint(ws: WebSocket):
             # From here on any failure (malformed WAV included — valid_audio
             # only checks length) must release the client, not kill the
             # session loop.
+            p_complete = None  # smart-turn probability, surfaced in the UI
             try:
                 # The audio classifier judges completeness before the LLM is
                 # involved at all. Incomplete → hold the segments (they stay
@@ -218,12 +223,13 @@ async def websocket_endpoint(ws: WebSocket):
                     complete, prob = await asyncio.get_event_loop().run_in_executor(
                         None, detector.predict, pcm)
                     decision_s = round(time.time() - t0, 3)
+                    p_complete = round(prob, 2)
                     if not complete and not interrupted.is_set():
                         held_audio = audio_b64s
                         await prime(held_audio)
                         await send_json(ws, {
                             "type": "turn_incomplete",
-                            "decision_s": decision_s, "p_complete": round(prob, 2),
+                            "decision_s": decision_s, "p_complete": p_complete,
                         })
                         continue
 
@@ -238,8 +244,11 @@ async def websocket_endpoint(ws: WebSocket):
 
                 instruction = turn_instruction(msg, bool(image), has_audio)
                 user_msg = {"role": "user", "content": content + [text_part(instruction)]}
+                is_flush = msg.get("type") == "flush"
                 raw_text = await run_turn(ws, history + [user_msg], interrupted, active,
-                                          tts_backend, expect_transcript=has_audio)
+                                          tts_backend, expect_transcript=has_audio,
+                                          p_complete=p_complete,
+                                          fallback=FLUSH_FALLBACK if is_flush else None)
                 # Store the turn verbatim (same bytes → full prefix-cache hit
                 # on the next request). Never store a turn the model produced
                 # nothing for — a degenerate message poisons all later requests.

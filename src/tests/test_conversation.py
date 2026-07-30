@@ -36,6 +36,8 @@ def test_short_question(session):
     t = session.turn(audio("capital_france"))
     assert t.marker == "complete"
     assert t.audio_chunks > 0
+    assert t.p_complete is not None and t.p_complete > 0.5, \
+        "turn-confidence missing from the protocol"
     assert wer(ref_text("capital_france"), t.transcription or "") <= WER_CLEAN
     assert "paris" in t.text.lower()
     assert_spoken_prose(t.text)

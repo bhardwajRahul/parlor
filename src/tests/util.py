@@ -98,6 +98,7 @@ class Session:
                 t.text += msg.get("text", "")
             elif kind == "transcript":  # pushed early, before the response
                 t.transcription = msg.get("transcription")
+                t.p_complete = msg.get("p_complete")
             elif kind == "audio_chunk":
                 t.audio_chunks += 1
             elif kind == "turn_incomplete":
