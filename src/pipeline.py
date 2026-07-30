@@ -369,13 +369,14 @@ async def run_turn(ws, messages: list, interrupted: asyncio.Event,
                    control_tags: tuple[str, ...] = (),
                    tts_voice: str = "af_heart",
                    proactive: bool = False,
-                   fallback: str | None = None) -> tuple[str, list]:
+                   fallback: str | None = None) -> tuple[str, list, int | None]:
     """Stream one model turn: decode → sentences → TTS, all pipelined. The
     transcript line is pushed to the client the moment it completes, while
     the response is still decoding. Returns the raw generated text (stored
-    verbatim in history so the next request gets a full prefix-cache hit)
-    and any control tags the model emitted — empty if interrupted, so an
-    aborted turn never fires an action.
+    verbatim in history so the next request gets a full prefix-cache hit),
+    any control tags the model emitted — empty if interrupted, so an
+    aborted turn never fires an action — and the request's real prompt
+    token count when llama-server reported one (drives history rotation).
 
     proactive marks a server-initiated turn (delegation delivery): the
     model's transcript line is its own echo, not the user's words, so no
@@ -512,7 +513,7 @@ async def run_turn(ws, messages: list, interrupted: asyncio.Event,
         # An aborted turn fires nothing, so its stored text must not carry
         # a tag either — the model must not believe it already delegated.
         text = parser._filter.strip(raw["text"]) if parser._filter else raw["text"]
-        return text, []
+        return text, [], stream.prompt_tokens
 
     await send_json(ws, {
         "type": "turn_final",
@@ -525,7 +526,7 @@ async def run_turn(ws, messages: list, interrupted: asyncio.Event,
     if audio_state["started"]:
         await send_json(ws, {"type": "audio_end",
                              "tts_time": timings.get("tts_time", 0)})
-    return raw["text"], parser.tags
+    return raw["text"], parser.tags, stream.prompt_tokens
 
 
 async def prime_cache(messages: list) -> None:

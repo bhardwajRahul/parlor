@@ -115,7 +115,7 @@ def stop() -> None:
 
 
 def _chat_body(messages: list, max_tokens: int, stream: bool) -> dict:
-    return {
+    body = {
         "messages": messages,
         "max_tokens": max_tokens,
         "temperature": TEMPERATURE,
@@ -123,6 +123,11 @@ def _chat_body(messages: list, max_tokens: int, stream: bool) -> dict:
         "cache_prompt": True,
         "chat_template_kwargs": {"enable_thinking": False},
     }
+    if stream:
+        # The final chunk then carries usage.prompt_tokens — the REAL
+        # context size, which drives history rotation (estimates drift).
+        body["stream_options"] = {"include_usage": True}
+    return body
 
 
 def chat_blocking(messages: list, max_tokens: int) -> str:
@@ -148,6 +153,7 @@ class ChatStream:
         self.body = _chat_body(messages, max_tokens, stream=True)
         self.conn = None
         self.cancelled = False
+        self.prompt_tokens: int | None = None  # real count, from the usage chunk
 
     def run(self, on_delta):
         # self.conn is published before the request is sent, so a cancel()
@@ -173,8 +179,12 @@ class ChatStream:
                 payload = line[6:]
                 if payload == b"[DONE]":
                     break
-                delta = json.loads(payload)["choices"][0].get("delta", {})
-                text = delta.get("content")
+                chunk = json.loads(payload)
+                usage = chunk.get("usage")
+                if usage and usage.get("prompt_tokens"):
+                    self.prompt_tokens = usage["prompt_tokens"]
+                choices = chunk.get("choices") or []
+                text = choices[0].get("delta", {}).get("content") if choices else None
                 if text:
                     on_delta(text)
         except Exception as e:

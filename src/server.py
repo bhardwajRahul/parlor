@@ -13,6 +13,7 @@ import asyncio
 import itertools
 import json
 import os
+import re
 import sys
 import time
 import traceback
@@ -68,7 +69,8 @@ DELEGATE_INSTRUCTION = (
     "asks about anything current or changing (weather, news, prices, "
     "scores, openings, \"right now\", \"today\"), you MUST hand the task "
     "over instead of answering from memory — your knowledge is stale and a "
-    "guess is worse than handing over. To hand over: say one short "
+    "guess is worse than handing over. Sports, elections, and rankings "
+    "count as current. To hand over: say one short "
     "sentence telling the user you're on it, then append <delegate>the "
     "task, restated to stand alone</delegate> — never speak or mention "
     "that tag; the result arrives later and you can share it then. "
@@ -134,6 +136,20 @@ MAX_PENDING_DELEGATIONS = 3
 # doesn't know is spoken aloud, task text included. Modes gate ACTING on a
 # tag (spawn_delegations, apply_mode_tags), never parsing it.
 CONTROL_TAGS = ("delegate", "mode")
+
+
+def strip_unfired_tags(text: str, tags: list) -> str:
+    """Remove tags from a turn's stored text when they did NOT fire (task
+    fragment skipped, cap hit, unknown mode, mode tag on a delivery). A
+    tag left in history without its action teaches the model a state the
+    server isn't in — observed live as the model 'translating' from
+    context while the server never switched and the mode chip never
+    appeared."""
+    for name, value in tags:
+        text = re.sub(
+            rf"<\s*{name.lower()}\s*>\s*{re.escape(value)}\s*(<\s*/\s*{name.lower()}\s*>)?",
+            "", text, flags=re.IGNORECASE)
+    return text
 
 # The transcript line LEADS the reply: transcribing after the response
 # turns the transcript into a paraphrase from memory (WER 0.39 vs 0.00 on a
@@ -266,6 +282,7 @@ async def websocket_endpoint(ws: WebSocket):
     delegation_tasks: set[asyncio.Task] = set()
     ready_delegations: list[dict] = []  # finished while the floor was busy
     playing_since = {"t": 0.0}  # last spoken reply is (probably) still playing
+    prompt_tokens = {"last": 0}  # real context size, from llama-server usage
 
     def floor_busy() -> bool:
         """The floor is held by the user (audio held for a continuation, a
@@ -286,18 +303,19 @@ async def websocket_endpoint(ws: WebSocket):
         if mode.allows_delegation and ready_delegations and not floor_busy():
             msg_queue.put_nowait(ready_delegations.pop(0))
 
-    async def switch_mode(name: str) -> None:
+    async def switch_mode(name: str) -> bool:
         """Enter a mode by name (model tag or UI escape hatch). Unknown and
-        already-current names are no-ops, so callers can pass raw values."""
+        already-current names are no-ops, so callers can pass raw values.
+        Returns whether a switch happened."""
         nonlocal mode, frame_image, speech_chunks, held_audio
         name = name.strip().lower()
         if name == mode.name:
-            return
+            return True  # already there — the tag "fired" in every sense
         if name not in MODES:
             # The model confirmed something out loud and then emitted junk —
             # make that diagnosable instead of a silent nothing.
             print(f"Ignoring unknown mode {name!r}")
-            return
+            return False
         mode = MODES[name]
         # Start the new mode clean: a switch through the UI escape hatch can
         # fire with audio held under the OLD mode's gating, and translate
@@ -309,11 +327,15 @@ async def websocket_endpoint(ws: WebSocket):
         print(f"Mode → {mode.name}")
         await send_json(ws, {"type": "mode_changed", "mode": mode.name})
         drain_ready()  # leaving translation frees deferred deliveries
+        return True
 
-    async def apply_mode_tags(tags: list[tuple[str, str]]) -> None:
+    async def apply_mode_tags(tags: list[tuple[str, str]]) -> list:
+        """Returns the mode tags that did NOT fire (for history stripping)."""
+        unfired = []
         for name, value in tags:
-            if name == "MODE":
-                await switch_mode(value)
+            if name == "MODE" and not await switch_mode(value):
+                unfired.append((name, value))
+        return unfired
 
     async def run_delegation(task_id: int, task: str) -> None:
         """Background reasoner call; its outcome re-enters the main loop
@@ -332,24 +354,38 @@ async def websocket_endpoint(ws: WebSocket):
         await msg_queue.put({"type": "delegation_done", "id": task_id,
                              "task": task, **outcome})
 
-    async def spawn_delegations(tags: list[tuple[str, str]]) -> None:
+    async def spawn_delegations(tags: list[tuple[str, str]]) -> list:
+        """Returns the delegate tags that did NOT fire (for history
+        stripping — the model must not believe research is underway)."""
+        delegate_tags = [(n, v) for n, v in tags if n == "DELEGATE"]
         if not delegation or not mode.allows_delegation:
             # The filter still parses <delegate> here (so it is never
             # spoken); without a reasoner, or mid-translation, it must
             # also never fire.
-            return
-        for name, value in tags:
-            if name == "DELEGATE" and value.strip():
-                if len(delegation_tasks) >= MAX_PENDING_DELEGATIONS:
-                    print(f"Delegation skipped (cap {MAX_PENDING_DELEGATIONS}): {value!r}")
-                    continue
-                task_id = next(delegation_ids)
-                print(f"Delegation #{task_id}: {value!r}")
-                await send_json(ws, {"type": "delegation_started",
-                                     "id": task_id, "task": value})
-                t = asyncio.create_task(run_delegation(task_id, value))
-                delegation_tasks.add(t)
-                t.add_done_callback(delegation_tasks.discard)
+            return delegate_tags
+        unfired = []
+        for name, value in delegate_tags:
+            task = value.strip()
+            if len(task.split()) < 3:
+                # An EOS-truncated fragment ('<delegate>search' cut mid-
+                # element) — a one-word task sends the reasoner nothing to
+                # work with (observed live: task 'search' came back as a
+                # clarification request, delivered verbatim).
+                print(f"Delegation skipped (fragment): {task!r}")
+                unfired.append((name, value))
+                continue
+            if len(delegation_tasks) >= MAX_PENDING_DELEGATIONS:
+                print(f"Delegation skipped (cap {MAX_PENDING_DELEGATIONS}): {task!r}")
+                unfired.append((name, value))
+                continue
+            task_id = next(delegation_ids)
+            print(f"Delegation #{task_id}: {task!r}")
+            await send_json(ws, {"type": "delegation_started",
+                                 "id": task_id, "task": task})
+            t = asyncio.create_task(run_delegation(task_id, task))
+            delegation_tasks.add(t)
+            t.add_done_callback(delegation_tasks.discard)
+        return unfired
 
     async def deliver_delegation(done: dict) -> None:
         """A server-initiated turn: the result goes into history and the
@@ -369,18 +405,21 @@ async def websocket_endpoint(ws: WebSocket):
         # does so here too (echoing the instruction). The transcript parser
         # consumes that line and streams the real delivery; with False the
         # ##-markup cut would swallow the entire reply (observed live).
-        raw_text, tags = await run_turn(ws, history + [user_msg], interrupted,
-                                        active, tts_backend,
-                                        expect_transcript=True,
-                                        control_tags=CONTROL_TAGS,
-                                        tts_voice=mode.tts_voice,
-                                        proactive=True,
-                                        fallback=done["answer"] if done["ok"]
-                                        else DELIVER_FALLBACK)
+        raw_text, tags, pt = await run_turn(ws, history + [user_msg], interrupted,
+                                            active, tts_backend,
+                                            expect_transcript=True,
+                                            control_tags=CONTROL_TAGS,
+                                            tts_voice=mode.tts_voice,
+                                            proactive=True,
+                                            fallback=done["answer"] if done["ok"]
+                                            else DELIVER_FALLBACK)
+        if pt:
+            prompt_tokens["last"] = pt
         if raw_text.strip():
             playing_since["t"] = time.time()  # this delivery is now playing
-        remember(user_msg, raw_text)
-        await spawn_delegations(tags)  # a delivery may chain deeper research
+        unfired = await spawn_delegations(tags)  # a delivery may chain research
+        unfired += [(n, v) for n, v in tags if n == "MODE"]  # never applied here
+        remember(user_msg, strip_unfired_tags(raw_text, unfired))
         drain_ready()                  # more results may already be waiting
 
     async def prime(audio_b64s: list[str]) -> None:
@@ -396,11 +435,20 @@ async def websocket_endpoint(ws: WebSocket):
                 break
 
             # Rotate history before the llama context fills: keep the system
-            # prompt and the most recent exchanges.
-            if estimate_tokens(history) > llama.CTX - CONTEXT_HEADROOM:
-                keep = 1 + max(2, (len(history) - 1) // 2)
-                print(f"Context near limit — dropping {len(history) - keep} oldest messages")
+            # prompt and the most recent exchanges. The REAL count from the
+            # last request wins over the estimate — when the estimate
+            # undershoots (camera turns), llama-server silently truncates
+            # the oldest turns first, which reads as the model "forgetting".
+            # Double headroom because the incoming turn isn't counted yet;
+            # drop a quarter (not half) so a rotation is barely noticeable.
+            est = estimate_tokens(history)
+            used = max(est, prompt_tokens["last"])
+            if used > llama.CTX - 2 * CONTEXT_HEADROOM:
+                keep = 1 + max(2, 3 * (len(history) - 1) // 4)
+                print(f"Context near limit (est {est}, real {prompt_tokens['last']}) "
+                      f"— dropping {len(history) - keep} oldest messages")
                 history = [history[0]] + history[-(keep - 1):]
+                prompt_tokens["last"] = 0  # stale after a rotation
 
             if msg.get("type") == "ready":
                 # The client returned to idle listening: playback finished,
@@ -521,18 +569,20 @@ async def websocket_endpoint(ws: WebSocket):
                     if has_audio:
                         instruction += MODE_SUFFIX
                 user_msg = {"role": "user", "content": content + [text_part(instruction)]}
-                raw_text, tags = await run_turn(ws, history + [user_msg], interrupted, active,
-                                                tts_backend, expect_transcript=has_audio,
-                                                p_complete=p_complete,
-                                                control_tags=CONTROL_TAGS,
-                                                tts_voice=mode.tts_voice,
-                                                fallback=FLUSH_FALLBACK if is_flush
-                                                else AUDIO_FALLBACK if has_audio else None)
+                raw_text, tags, pt = await run_turn(ws, history + [user_msg], interrupted, active,
+                                                    tts_backend, expect_transcript=has_audio,
+                                                    p_complete=p_complete,
+                                                    control_tags=CONTROL_TAGS,
+                                                    tts_voice=mode.tts_voice,
+                                                    fallback=FLUSH_FALLBACK if is_flush
+                                                    else AUDIO_FALLBACK if has_audio else None)
+                if pt:
+                    prompt_tokens["last"] = pt
                 if raw_text.strip():
                     playing_since["t"] = time.time()  # reply now playing client-side
-                remember(user_msg, raw_text)
-                await spawn_delegations(tags)
-                await apply_mode_tags(tags)
+                unfired = await spawn_delegations(tags)
+                unfired += await apply_mode_tags(tags)
+                remember(user_msg, strip_unfired_tags(raw_text, unfired))
             except DISCONNECT_ERRORS:
                 raise
             except Exception:
