@@ -119,6 +119,56 @@ async def release_client(ws) -> None:
 
 # ── streaming turn parser ─────────────────────────────────────────────────
 
+class TagFilter:
+    """Streams response text through, extracting complete
+    '<name>value</name>' control elements into .tags and holding back any
+    suffix that may still become one. XML elements (not ###NAME: lines)
+    because the model emits them more reliably — benchmarks/tagbench.py
+    measured recall 0.667 vs 0.417 on E4B — and the explicit close tag
+    means a tag completes mid-stream and a half-streamed value can never
+    be extracted. Held text is released only once it turns out not to be
+    an element, so markup still open when the stream ends is never spoken
+    and never fires: a delegation with half its task is worse than none."""
+
+    def __init__(self, names: tuple[str, ...]):
+        self._opens = [f"<{n.lower()}>" for n in names]
+        self._re = re.compile(
+            r"<(?P<name>" + "|".join(names) + r")>\s*(?P<value>[^<]*?)\s*"
+            r"</(?P=name)>", re.IGNORECASE)
+        self._held = ""
+        self.tags: list[tuple[str, str]] = []  # (NAME, value), stream order
+
+    def _viable(self, rest: str) -> bool:
+        """Could `rest` (starting at '<') still grow into, or already be
+        inside, a control element?"""
+        rest = rest.lower()
+        return any(o.startswith(rest) or rest.startswith(o) for o in self._opens)
+
+    def feed(self, delta: str) -> str:
+        """Returns the speakable text released by this delta."""
+        buf = self._held + delta
+        self._held = ""
+        out = []
+        while buf:
+            lt = buf.find("<")
+            if lt == -1:
+                out.append(buf)
+                break
+            out.append(buf[:lt])
+            m = self._re.match(buf, lt)
+            if m:
+                self.tags.append((m.group("name").upper(), m.group("value").strip()))
+                out.append("\n")  # keep a boundary where the element sat
+                buf = buf[m.end():]
+            elif self._viable(buf[lt:]):
+                self._held = buf[lt:]
+                break
+            else:
+                out.append("<")  # literal '<', not ours
+                buf = buf[lt + 1:]
+        return "".join(out)
+
+
 class StreamParser:
     """Incrementally parses '###TRANSCRIPT: <words>\\n<response>'.
 
@@ -133,16 +183,32 @@ class StreamParser:
     partial sentence and the transcript. With expect_transcript=False
     (text/image turns) the reply streams directly and any imitated
     trailing tag is cut, never spoken.
+
+    control_tags names '<name>value</name>' elements the model may emit
+    as actions (e.g. delegate, mode). A recognized element is excised by
+    a TagFilter — appended to self.tags, never spoken — and speech
+    resumes after it; '##…' markup keeps the terminal cut above.
     """
 
-    def __init__(self, expect_transcript: bool = True):
+    def __init__(self, expect_transcript: bool = True,
+                 control_tags: tuple[str, ...] = ()):
         self.response = ""
         self.transcript: str | None = None
+        self._filter = TagFilter(control_tags) if control_tags else None
         self._awaiting = expect_transcript
         self._got_tag = False
         self._buf = ""
         self._before_tag = ""  # stray text before the tag → response prefix
         self._emitted = 0
+
+    @property
+    def tags(self) -> list[tuple[str, str]]:
+        return self._filter.tags if self._filter else []
+
+    def _release(self, text: str) -> str:
+        """Response text passes through the control-tag filter (if any)
+        before it can be spoken."""
+        return self._filter.feed(text) if self._filter else text
 
     def feed(self, delta: str) -> list[str]:
         if self._awaiting:
@@ -165,11 +231,12 @@ class StreamParser:
                 m = SENTENCE_END_RE.search(self._buf)
                 newline = m.end() - 1 if m else len(self._buf) - 1
             self.transcript = self._buf[:newline].strip() or None
-            self.response = (self._before_tag + self._buf[newline + 1:]).lstrip()
+            self.response = self._release(
+                (self._before_tag + self._buf[newline + 1:]).lstrip())
             self._awaiting = False
             self._buf = ""
         else:
-            self.response += delta
+            self.response += self._release(delta)
         return self._complete_sentences()
 
     def _complete_sentences(self) -> list[str]:
@@ -199,9 +266,9 @@ class StreamParser:
                 m = SENTENCE_END_RE.search(self._buf)
                 cut = m.end() if m else len(self._buf)
                 self.transcript = self._buf[:cut].strip() or None
-                self.response = self._before_tag + self._buf[cut:]
+                self.response = self._release(self._before_tag + self._buf[cut:])
             else:
-                self.response = self._buf
+                self.response = self._release(self._buf)
             self._awaiting = False
         sentences = self._complete_sentences()
         # Cut any imitated tag markup — never speak it.

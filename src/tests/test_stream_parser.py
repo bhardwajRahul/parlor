@@ -117,3 +117,123 @@ def test_streaming_matches_batch_for_every_split_point():
     batch = run([CANONICAL])
     for i in range(1, len(CANONICAL)):
         assert run([CANONICAL[:i], CANONICAL[i:]]) == batch, f"diverged at split {i}"
+
+
+# ── control tags ──────────────────────────────────────────────────────────
+# Why XML elements rather than ###NAME: lines: see TagFilter in pipeline.py.
+
+TAGS = ("delegate", "mode")
+
+
+def run_tags(deltas, expect_transcript=True):
+    """-> (spoken sentences, transcript, extracted tags)"""
+    p = StreamParser(expect_transcript, control_tags=TAGS)
+    spoken = []
+    for d in deltas:
+        spoken += p.feed(d)
+    tail, transcript = p.finalize()
+    return spoken + tail, transcript, p.tags
+
+
+DELEGATED = ("###TRANSCRIPT: What's the best pizza in Rome?\n"
+             "Great question — let me dig into that. "
+             "<delegate>best pizza places in Rome right now</delegate>")
+
+
+@pytest.mark.parametrize("deltas", [
+    [DELEGATED],
+    char_deltas(DELEGATED),
+    ["###TRANSCRIPT: What's the best pizza in Rome?", "\n",
+     "Great question — let me dig into that.", " <", "delegate", ">",
+     "best pizza places", " in Rome right now", "</", "delegate", ">"],
+], ids=["batch", "char3", "tokenwise"])
+def test_delegate_tag_extracted_never_spoken(deltas):
+    spoken, transcript, tags = run_tags(deltas)
+    assert transcript == "What's the best pizza in Rome?"
+    assert spoken == ["Great question — let me dig into that."]
+    assert tags == [("DELEGATE", "best pizza places in Rome right now")]
+
+
+def test_open_tag_value_is_never_extracted_or_spoken_early():
+    # The value may still be streaming: extracting at the first feed would
+    # fire a delegation with half the task, and none of it may reach TTS.
+    p = StreamParser(control_tags=TAGS)
+    assert p.feed("###TRANSCRIPT: hi\nOk. <delegate>first half") == ["Ok."]
+    assert p.tags == []
+    p.feed(" second half</delegate>")
+    assert p.tags == [("DELEGATE", "first half second half")]
+
+
+def test_unclosed_tag_at_stream_end_is_dropped_not_spoken():
+    # Truncated stream (or the model forgot the close tag): firing a
+    # half-task or speaking the markup are both worse than dropping it.
+    spoken, _, tags = run_tags(["###TRANSCRIPT: hi\n", "Sure. ",
+                                "<delegate>look something up"])
+    assert spoken == ["Sure."]
+    assert tags == []
+
+
+def test_speech_resumes_after_a_tag():
+    spoken, _, tags = run_tags(["###TRANSCRIPT: hi\n",
+                                "One moment. <mode>translate target=en</mode>",
+                                " Switching now. "])
+    assert spoken == ["One moment.", "Switching now."]
+    assert tags == [("MODE", "translate target=en")]
+
+
+def test_unrecognized_markup_keeps_the_terminal_cut():
+    spoken, _, tags = run_tags(["###TRANSCRIPT: hi\n", "Hello. ",
+                                "## Notes: stuff. Never spoken. "])
+    assert spoken == ["Hello."]
+    assert tags == []
+
+
+def test_literal_angle_bracket_is_released():
+    spoken, _, tags = run_tags(["###TRANSCRIPT: hi\n",
+                                "Five < 10 is true. <delegate>x</delegate>"])
+    assert spoken == ["Five < 10 is true."]
+    assert tags == [("DELEGATE", "x")]
+
+
+def test_unknown_element_is_released_as_text():
+    # Only configured names are control tags; other markup-ish text the
+    # model produces is ordinary (spoken) output.
+    spoken, _, tags = run_tags(["###TRANSCRIPT: hi\n", "I like <b>bold</b> text. "])
+    assert spoken == ["I like <b>bold</b> text."]
+    assert tags == []
+
+
+def test_tag_only_reply_yields_tag_and_no_speech():
+    spoken, _, tags = run_tags(["<delegate>solo task</delegate>"])
+    assert spoken == []
+    assert tags == [("DELEGATE", "solo task")]
+
+
+def test_no_transcript_mode_extracts_tags():
+    spoken, transcript, tags = run_tags(
+        ["I see a cat. ", "<mode>conversation</mode>"], expect_transcript=False)
+    assert transcript is None
+    assert spoken == ["I see a cat."]
+    assert tags == [("MODE", "conversation")]
+
+
+def test_back_to_back_tags():
+    spoken, _, tags = run_tags(["###TRANSCRIPT: hi\n", "On it. ",
+                                "<delegate>task one</delegate>",
+                                "<mode>translate target=en</mode>"])
+    assert spoken == ["On it."]
+    assert tags == [("DELEGATE", "task one"), ("MODE", "translate target=en")]
+
+
+def test_streaming_matches_batch_for_every_split_point_with_tags():
+    batch = run_tags([DELEGATED])
+    for i in range(1, len(DELEGATED)):
+        assert run_tags([DELEGATED[:i], DELEGATED[i:]]) == batch, f"diverged at split {i}"
+
+
+def test_parser_without_control_tags_is_unchanged():
+    # No control_tags configured → a delegate element is just text; the
+    # ##-markup cut still applies to hash markup.
+    spoken, _, _ = run(["###TRANSCRIPT: hi\n", "Hello. ",
+                        "<delegate>x</delegate> ## notes"])
+    assert spoken == ["Hello.", "<delegate>x</delegate>"]
