@@ -174,6 +174,8 @@ function connect() {
   ws.onclose = () => {
     // A reconnect gets a brand-new server conversation — reset per-turn state.
     framePrefetched = false;
+    serverHoldingAudio = false;
+    removeLastUserLoading();
     clearFlushTimer();
     setStatus('disconnected', 'Disconnected');
     setTimeout(connect, 2000);
@@ -187,7 +189,8 @@ function connect() {
       // The classifier judged the user unfinished — keep listening; if they
       // stay silent, flush the held audio so the model answers anyway.
       if (ignoreIncomingAudio) { ignoreIncomingAudio = false; return; }
-      removeLastUserLoading();
+      // Keep the pending bubble: the held audio is still this utterance,
+      // and the eventual merged transcript will fill it.
       serverHoldingAudio = true;
       goListening();
       startFlushTimer();
@@ -198,7 +201,11 @@ function connect() {
       fillUserBubble(msg.transcription);
     } else if (msg.type === 'turn_final') {
       if (ignoreIncomingAudio) return;
-      fillUserBubble(msg.transcription);
+      if (!msg.spoke && !msg.transcription) {
+        removeLastUserLoading();  // glitch/empty turn — nothing was heard
+      } else {
+        fillUserBubble(msg.transcription);
+      }
       const t = msg.timings || {};
       if (t.llm_time) {
         setAssistantMeta(`LLM ${t.llm_time}s` + (t.ttfa_s ? ` · audio @ ${t.ttfa_s}s` : ''));
@@ -215,7 +222,7 @@ function connect() {
       if (ignoreIncomingAudio) {
         ignoreIncomingAudio = false;
         stopPlayback();
-        setState('listening');
+        goListening();
         return;
       }
       const meta = messagesDiv.querySelector('.msg.assistant:last-child .meta');
@@ -252,10 +259,21 @@ function setAssistantMeta(text) {
   meta.textContent = text;
 }
 
-function removeLastUserLoading() {
+function pendingUserBubble() {
   const userMsgs = messagesDiv.querySelectorAll('.msg.user');
   const last = userMsgs[userMsgs.length - 1];
-  if (last && last.querySelector('.loading-dots')) last.remove();
+  return last && last.querySelector('.loading-dots') ? last : null;
+}
+
+function removeLastUserLoading() {
+  const bubble = pendingUserBubble();
+  if (bubble) bubble.remove();
+}
+
+// One pending bubble per utterance-group: a continuation after a hold (or a
+// flush) belongs to the same bubble the first segment created.
+function addUserLoadingBubble(meta) {
+  if (!pendingUserBubble()) addMessage('user', LOADING_DOTS, meta);
 }
 
 // Replace the last user bubble's loading dots with the heard words (no-op if
@@ -287,7 +305,7 @@ function startFlushTimer() {
       serverHoldingAudio = false;
       currentAssistantEl = null;
       ignoreIncomingAudio = false;
-      addMessage('user', LOADING_DOTS);
+      addUserLoadingBubble();
       wsSend({ type: 'flush' });
       goProcessing();
     }
@@ -430,7 +448,7 @@ function triggerBargeIn() {
   stopPlayback();
   ignoreIncomingAudio = true;
   wsSend({ type: 'interrupt' });
-  setState('listening');
+  goListening();
   prefetchFrame();
   startUtteranceCapture();
   console.log('Barge-in: interrupted playback');
@@ -449,7 +467,7 @@ function handleSpeechEnd(audio) {
   framePrefetched = false;
 
   goProcessing();
-  addMessage('user', LOADING_DOTS, withCamera ? 'with camera' : '');
+  addUserLoadingBubble(withCamera ? 'with camera' : '');
 
   currentAssistantEl = null;
   ignoreIncomingAudio = false;

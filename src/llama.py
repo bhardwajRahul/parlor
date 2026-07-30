@@ -17,7 +17,8 @@ load_dotenv()  # config below is read at import time — .env must apply first
 # Google's official QAT quants: q4_0 quality trained-in, faster than
 # K-quants. MODEL picks the size; MODEL_PATH/MMPROJ_PATH override entirely.
 # Rough guide on an M3 Pro: e2b ≈ 0.6-1.0s to first audio, e4b ≈ 1.0-1.7s
-# (noticeably better answers), 12b needs ~8GB and is slower still.
+# (noticeably better answers — the default), 12b needs ~8GB and is slower
+# still.
 MODELS = {
     "e2b": ("google/gemma-4-E2B-it-qat-q4_0-gguf",
             "gemma-4-E2B_q4_0-it.gguf", "gemma-4-E2B-it-mmproj.gguf"),
@@ -26,7 +27,7 @@ MODELS = {
     "12b": ("google/gemma-4-12B-it-qat-q4_0-gguf",
             "gemma-4-12b-it-qat-q4_0.gguf", "mmproj-gemma-4-12b-it-qat-q4_0.gguf"),
 }
-MODEL = os.environ.get("MODEL", "e2b").lower()
+MODEL = os.environ.get("MODEL", "e4b").lower()
 
 PORT = int(os.environ.get("LLAMA_PORT", "8081"))
 URL = os.environ.get("LLAMA_SERVER_URL", "")  # set to use an external server

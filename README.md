@@ -62,13 +62,13 @@ uv run server.py
 
 Open [http://localhost:8000](http://localhost:8000), grant camera and microphone access, and start talking.
 
-Models are downloaded automatically on first run (~4 GB for Gemma 4 E2B QAT + its multimodal projector, plus TTS models).
+Models are downloaded automatically on first run (~4-5 GB for Gemma 4 E4B QAT + its multimodal projector, plus TTS models).
 
 ## Configuration
 
 | Variable           | Default                        | Description                                    |
 | ------------------ | ------------------------------ | ---------------------------------------------- |
-| `MODEL`            | `e2b`                          | Gemma 4 size: `e2b` (fastest), `e4b` (better answers, ~1.8x latency), `12b` (needs ~8GB) |
+| `MODEL`            | `e4b`                          | Gemma 4 size: `e2b` (fastest), `e4b` (better answers, ~1.8x e2b latency), `12b` (needs ~8GB) |
 | `MODEL_PATH`       | auto-download from HuggingFace | Path to a local Gemma 4 `.gguf` file (overrides `MODEL`) |
 | `MMPROJ_PATH`      | auto-download from HuggingFace | Path to the matching `mmproj` `.gguf` (audio + vision encoders) |
 | `PORT`             | `8000`                         | Server port                                    |
