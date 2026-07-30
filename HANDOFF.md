@@ -58,7 +58,8 @@ and what still needs human testing. Delete this file before merging.
    load. `PARLOR_TEST_URL` runs it against a live server.
 
 8. **Model size switch** — `MODEL=e2b|e4b|12b` picks among Google's QAT
-   q4_0 GGUFs (E2B default). The llama.cpp chat template was verified
+   q4_0 GGUFs (E4B default — live testing found its answers noticeably
+   better and the ~1.8x latency still ~3x faster than baseline). The llama.cpp chat template was verified
    current: the GGUF embeds the 2026-07-09 canonical template
    byte-identical to the upstream tool-calling fix
    (google/gemma-4-E2B-it#35), and llama-server ≥b10150 applies it via
@@ -122,9 +123,9 @@ Hard-refresh the browser (Cmd+Shift+R) after every server restart.
 
 - [ ] Transcripts of YOUR real voice are accurate, including the last word
       of each utterance (the padding fix targets exactly this).
-- [ ] Responses feel at least as good as main. If not: try E4B via
-      `MODEL_PATH`/`MMPROJ_PATH` (unsloth/gemma-4-E4B-it-GGUF) — roughly 2x
-      latency.
+- [ ] Responses feel at least as good as main (E4B is the default now;
+      `MODEL=12b` is the next step up if quality still lacks, `MODEL=e2b`
+      the fast fallback).
 - [ ] **Multilingual** (the Bule-AI use case): speak Indonesian or another
       language → understanding and transcript quality. Kokoro voice
       `af_heart` is English; non-English TTS output is a known gap.

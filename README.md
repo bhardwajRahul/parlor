@@ -2,7 +2,7 @@
 
 On-device, real-time multimodal AI. Have natural voice and vision conversations with an AI that runs entirely on your machine.
 
-Parlor uses [Gemma 4 E2B](https://huggingface.co/google/gemma-4-E2B-it) for understanding speech and vision, and [Kokoro](https://huggingface.co/hexgrad/Kokoro-82M) for text-to-speech. You talk, show your camera, and it talks back, all locally.
+Parlor uses [Gemma 4 E4B](https://huggingface.co/google/gemma-4-E4B-it) for understanding speech and vision (switchable to E2B or 12B), and [Kokoro](https://huggingface.co/hexgrad/Kokoro-82M) for text-to-speech. You talk, show your camera, and it talks back, all locally.
 
 https://github.com/user-attachments/assets/cb0ffb2e-f84f-48e7-872c-c5f7b5c6d51f
 
@@ -24,7 +24,7 @@ Browser (mic + camera)
     │  WebSocket (audio PCM + JPEG frames)
     ▼
 FastAPI server
-    ├── Gemma 4 E2B via llama.cpp (QAT q4_0)  →  understands speech + vision
+    ├── Gemma 4 E4B via llama.cpp (QAT q4_0)  →  understands speech + vision
     └── Kokoro TTS (MLX on Mac, ONNX on Linux)  →  speaks back
     │
     │  WebSocket (streamed audio chunks)
@@ -43,7 +43,7 @@ Browser (playback + transcript)
 - Python 3.12+
 - [llama.cpp](https://github.com/ggml-org/llama.cpp) (`brew install llama.cpp` on macOS)
 - macOS with Apple Silicon, or Linux with a supported GPU
-- ~4 GB free RAM for the model
+- ~6 GB free RAM for the default E4B model (`MODEL=e2b` fits in ~4 GB)
 
 ## Quick start
 
@@ -62,7 +62,7 @@ uv run server.py
 
 Open [http://localhost:8000](http://localhost:8000), grant camera and microphone access, and start talking.
 
-Models are downloaded automatically on first run (~4-5 GB for Gemma 4 E4B QAT + its multimodal projector, plus TTS models).
+Models are downloaded automatically on first run (~5.7 GB for Gemma 4 E4B QAT + its multimodal projector, plus TTS models).
 
 ## Configuration
 
@@ -79,7 +79,7 @@ Models are downloaded automatically on first run (~4-5 GB for Gemma 4 E4B QAT + 
 
 ## Performance (Apple M3 Pro)
 
-Measured from end of utterance to first audio heard (add ~200ms of VAD silence detection on top). The camera frame and the speech itself are prefilled while you're still speaking, and the reply opens with the transcript line (its decode time is included below — the price of accurate transcripts):
+Measured with `MODEL=e2b` from end of utterance to first audio heard (add ~200ms of VAD silence detection on top; the default E4B is roughly 1.8x these numbers, with noticeably better answers). The camera frame and the speech itself are prefilled while you're still speaking, and the reply opens with the transcript line (its decode time is included below — the price of accurate transcripts):
 
 | Turn                                  | First audio | Turn complete |
 | ------------------------------------- | ----------- | ------------- |
