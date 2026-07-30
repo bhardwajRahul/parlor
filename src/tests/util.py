@@ -9,8 +9,14 @@ import time
 import wave
 from dataclasses import dataclass, field
 
+import fixtures
 import numpy as np
 from websockets.sync.client import connect
+
+
+def audio(name: str) -> dict:
+    """Turn payload carrying one fixture utterance, as the client sends it."""
+    return {"audio": fixtures.load_wav_b64(name)}
 
 
 def norm_words(text: str) -> list[str]:
@@ -90,6 +96,8 @@ class Session:
             kind = msg.get("type")
             if kind == "text_delta":
                 t.text += msg.get("text", "")
+            elif kind == "transcript":  # pushed early, before the response
+                t.transcription = msg.get("transcription")
             elif kind == "audio_chunk":
                 t.audio_chunks += 1
             elif kind == "turn_incomplete":

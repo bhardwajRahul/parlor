@@ -2,11 +2,7 @@
 turns, per-connection isolation, context rotation."""
 
 import fixtures as fx
-from util import Session, silence_wav_b64
-
-
-def audio(name: str) -> dict:
-    return {"audio": fx.load_wav_b64(name)}
+from util import Session, audio, silence_wav_b64
 
 
 def test_glitch_audio_releases_client(session):
@@ -39,8 +35,8 @@ def test_interrupt_aborts_generation(session):
 def test_turns_queue_while_processing(session):
     """Talking while the previous turn is still processing: both turns are
     answered, in order."""
-    session.send({"audio": fx.load_wav_b64("capital_france")})
-    session.send({"audio": fx.load_wav_b64("long_question")})
+    session.send(audio("capital_france"))
+    session.send(audio("long_question"))
     t1 = session.collect_turn()
     t2 = session.collect_turn(timeout=120)
     assert t1.marker == "complete" and "paris" in t1.text.lower()
@@ -56,7 +52,7 @@ def test_fresh_conversation_per_connection(server):
     with Session(server.url) as s:
         t = s.turn(audio("name_recall"))
         assert t.marker == "complete"
-        assert "alex" not in t.text.lower(), "history leaked across connections"
+        assert "willow" not in t.text.lower(), "history leaked across connections"
 
 
 def test_context_rotation_survives(server, session):
@@ -65,8 +61,7 @@ def test_context_rotation_survives(server, session):
     server.require_managed()
     rotated = False
     for _ in range(8):
-        t = session.turn({"image": fx.make_image_b64(), "audio": fx.load_wav_b64("capital_france")},
-                         timeout=120)
+        t = session.turn({**audio("capital_france"), "image": fx.make_image_b64()}, timeout=120)
         assert t.marker == "complete", f"turn failed before/during rotation: {t}"
         if "dropping" in server.log():
             rotated = True

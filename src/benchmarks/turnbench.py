@@ -11,7 +11,7 @@ pipecat's smart-turn v3.2 test set (`endpoint_bool`: did the turn end?):
 Only real human recordings are used (`synthetic=false`). TTS-synthesized
 clips read as finished no matter what the words are, which flatters the
 LLM modes and unfairly punishes the acoustic one — the same effect that
-makes the `thinking_suppressed` check in bench.py fail by construction.
+makes tests/test_conversation.py::test_thinking_pause_is_held unrunnable.
 Pass --synthetic to include them anyway; outside English they are often
 all a language has (every Indonesian clip in the set is synthetic).
 

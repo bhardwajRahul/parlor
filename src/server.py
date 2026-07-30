@@ -35,12 +35,13 @@ except ImportError:  # pragma: no cover
 DISCONNECT_ERRORS = (WebSocketDisconnect, ClientDisconnected)
 
 from dotenv import load_dotenv
-load_dotenv()
+load_dotenv()  # before importing llama — it reads its config at import time
 
 import llama
 import tts
-from pipeline import (estimate_tokens, pad_tail_silence, prime_cache, run_turn,
-                      text_part, user_content, valid_audio, wav_to_float32)
+from pipeline import (estimate_tokens, pad_tail_silence, prime_cache,
+                      release_client, run_turn, send_json, text_part,
+                      user_content, valid_audio, wav_to_float32)
 
 # Turn completeness is judged by the smart-turn audio classifier before the
 # LLM is involved, so the prompt carries no FINISHED/WAIT machinery at all.
@@ -52,21 +53,30 @@ SYSTEM_PROMPT = (
     "spoken aloud, so write plain conversational text without formatting."
 )
 
-# The reply streams straight into TTS, so the format is: response first
-# (sentences are spoken as they decode), transcript last (it never delays
-# first audio).
+# The transcript line LEADS the reply: transcribing after the response
+# turns the transcript into a paraphrase from memory (WER 0.39 vs 0.00 on a
+# clean 33-word utterance), and the leading line reaches the client while
+# the response still decodes. Costs its decode time (~0.2s short / ~0.7s
+# long utterances) before first audio — measured worth it. Grammar-forced
+# JSON ({transcript, response}) was also measured: format breaks 1-3/3 on
+# degraded audio and 3/3 on chunked — don't go back to structured output.
 RESPOND_PROMPT = (
-    "Respond to what the user said in their audio message: 1-4 short "
-    "sentences, spoken aloud.{camera} Then end your reply with a new line: "
-    "###TRANSCRIPT: followed by the exact words the user said."
+    "Begin your reply with one line: ###TRANSCRIPT: followed by the exact "
+    "words the user said in their audio message. Then, on a new line, respond "
+    "to them: 1-4 short sentences, spoken aloud.{camera}"
 )
 
-# Sent with a "flush" turn: the classifier judged the utterance unfinished,
-# the user then stayed silent, so answer what we have — the model decides
-# whether it is answerable or needs encouragement to continue.
-FLUSH_SUFFIX = (
-    " The user paused mid-thought. If their words feel unfinished, reply with "
-    "one short, warm sentence encouraging them to continue instead of answering."
+# A "flush" turn: the classifier judged the utterance unfinished, the user
+# then stayed silent, so answer what we have — the model decides whether it
+# is answerable or needs encouragement to continue. Dedicated prompt: with
+# a bolted-on suffix the model would sometimes emit the transcript line and
+# stop, leaving the turn silent.
+FLUSH_PROMPT = (
+    "Begin your reply with one line: ###TRANSCRIPT: followed by the exact "
+    "words the user said in their audio message. The user paused mid-thought, "
+    "so on a new line: if their words feel unfinished, write one short, warm "
+    "sentence encouraging them to continue; otherwise respond to them in 1-4 "
+    "short sentences, spoken aloud.{camera}"
 )
 
 # Rotate history before the llama context fills. Rough token estimates are
@@ -104,10 +114,8 @@ async def root():
 def turn_instruction(msg: dict, has_image: bool, has_audio: bool) -> str:
     if has_audio:
         camera = " Mention what you see on their camera if relevant." if has_image else ""
-        instruction = RESPOND_PROMPT.format(camera=camera)
-        if msg.get("type") == "flush":
-            instruction += FLUSH_SUFFIX
-        return instruction
+        prompt = FLUSH_PROMPT if msg.get("type") == "flush" else RESPOND_PROMPT
+        return prompt.format(camera=camera)
     if has_image:
         return "The user is showing you their camera. Describe what you see."
     return msg.get("text", "Hello!")
@@ -148,6 +156,12 @@ async def websocket_endpoint(ws: WebSocket):
     speech_chunks: list[str] = []    # streamed-in speech, already cache-primed
     held_audio: list[str] = []       # incomplete-turn segments awaiting continuation
 
+    async def prime(audio_b64s: list[str]) -> None:
+        """Warm the cache for the turn as it stands so far — reads the live
+        history and held camera frame, so it must stay in this scope."""
+        await prime_cache(history + [
+            {"role": "user", "content": user_content(frame_image, audio_b64s)}])
+
     try:
         while True:
             msg = await msg_queue.get()
@@ -165,8 +179,7 @@ async def websocket_endpoint(ws: WebSocket):
                 if msg.get("image"):
                     frame_image = msg["image"]
                     speech_chunks = []
-                    await prime_cache(history + [
-                        {"role": "user", "content": user_content(frame_image, held_audio)}])
+                    await prime(held_audio)
                 continue
 
             if msg.get("type") == "speech_chunk":
@@ -174,62 +187,59 @@ async def websocket_endpoint(ws: WebSocket):
                     speech_chunks = []
                 if valid_audio(msg.get("audio")):
                     speech_chunks.append(msg["audio"])
-                    await prime_cache(history + [
-                        {"role": "user",
-                         "content": user_content(frame_image, held_audio + speech_chunks)}])
+                    await prime(held_audio + speech_chunks)
                 continue
 
             interrupted.clear()
-            chunks = speech_chunks if msg.get("chunked") else []
+            audio_b64s = held_audio + (speech_chunks if msg.get("chunked") else [])
             speech_chunks = []
-            audio_b64s = held_audio + chunks
             if valid_audio(msg.get("audio")):
                 audio_b64s.append(msg["audio"])
             image = msg.get("image") or frame_image
             has_audio = bool(audio_b64s)
 
-            if not audio_b64s and not image and not msg.get("text"):
-                # Mic glitch (or a flush with nothing held) produced no usable
-                # media — release the client.
-                await ws.send_text(json.dumps({
-                    "type": "turn_final", "transcription": None,
-                    "timings": {}, "spoke": False,
-                }))
+            if not has_audio and not image and not msg.get("text"):
+                # Mic glitch (or a flush with nothing held) produced no usable media.
+                await release_client(ws)
                 continue
 
-            # The audio classifier judges completeness before the LLM is
-            # involved at all. Incomplete → hold the segments (they stay in
-            # the next turn's content AND warm in the cache) and wait. A
-            # flush turn skips the check: the client waited out the hold and
-            # now wants an answer to whatever we have.
-            if has_audio and msg.get("type") != "flush":
-                pcm = np.concatenate([wav_to_float32(b) for b in audio_b64s])
-                t0d = time.time()
-                complete, prob = await asyncio.get_event_loop().run_in_executor(
-                    None, detector.predict, pcm)
-                decision_s = round(time.time() - t0d, 3)
-                if not complete and not interrupted.is_set():
-                    held_audio = audio_b64s
-                    await prime_cache(history + [
-                        {"role": "user", "content": user_content(frame_image, held_audio)}])
-                    await ws.send_text(json.dumps({
-                        "type": "turn_incomplete",
-                        "decision_s": decision_s, "p_complete": round(prob, 2),
-                    }))
-                    continue
-
-            if audio_b64s:
-                audio_b64s[-1] = pad_tail_silence(audio_b64s[-1])
-            content = user_content(image, audio_b64s)
-            has_image = bool(image)
-            frame_image = None
-            held_audio = []
-
+            # From here on any failure (malformed WAV included — valid_audio
+            # only checks length) must release the client, not kill the
+            # session loop.
             try:
-                instruction = turn_instruction(msg, has_image, has_audio)
+                # The audio classifier judges completeness before the LLM is
+                # involved at all. Incomplete → hold the segments (they stay
+                # in the next turn's content AND warm in the cache) and wait.
+                # A flush turn skips the check: the client waited out the
+                # hold and now wants an answer to whatever we have.
+                if has_audio and msg.get("type") != "flush":
+                    pcm = np.concatenate([wav_to_float32(b) for b in audio_b64s])
+                    t0 = time.time()
+                    complete, prob = await asyncio.get_event_loop().run_in_executor(
+                        None, detector.predict, pcm)
+                    decision_s = round(time.time() - t0, 3)
+                    if not complete and not interrupted.is_set():
+                        held_audio = audio_b64s
+                        await prime(held_audio)
+                        await send_json(ws, {
+                            "type": "turn_incomplete",
+                            "decision_s": decision_s, "p_complete": round(prob, 2),
+                        })
+                        continue
+
+                # Padding the final segment diverges it from its primed bytes
+                # on flush turns (≤3s re-prefilled) — the honest-transcript
+                # win beats that; the continuation path keeps its cache hits.
+                if audio_b64s:
+                    audio_b64s[-1] = pad_tail_silence(audio_b64s[-1])
+                content = user_content(image, audio_b64s)
+                frame_image = None
+                held_audio = []
+
+                instruction = turn_instruction(msg, bool(image), has_audio)
                 user_msg = {"role": "user", "content": content + [text_part(instruction)]}
                 raw_text = await run_turn(ws, history + [user_msg], interrupted, active,
-                                          tts_backend)
+                                          tts_backend, expect_transcript=has_audio)
                 # Store the turn verbatim (same bytes → full prefix-cache hit
                 # on the next request). Never store a turn the model produced
                 # nothing for — a degenerate message poisons all later requests.
@@ -239,13 +249,8 @@ async def websocket_endpoint(ws: WebSocket):
             except DISCONNECT_ERRORS:
                 raise
             except Exception:
-                # Keep the session alive and release the client from
-                # its 'processing' state.
-                traceback.print_exc()
-                await ws.send_text(json.dumps({
-                    "type": "turn_final", "transcription": None,
-                    "timings": {}, "spoke": False,
-                }))
+                traceback.print_exc()  # keep the session alive
+                await release_client(ws)
     except DISCONNECT_ERRORS:
         print("Client disconnected")
     finally:

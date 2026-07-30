@@ -14,10 +14,12 @@ import numpy as np
 
 import llama
 
-TRANSCRIPT_TAG = "###TRANSCRIPT:"
-# The model takes liberties with the tag ("### TRANSCRIPT: ..."), so parse
-# it tolerantly — a dropped transcript looks like a broken turn to the user.
-TRANSCRIPT_TAG_RE = re.compile(r"#{2,}\s*TRANSCRIPT:?\s*", re.IGNORECASE)
+# Parsed tolerantly ("### TRANSCRIPT : ..." happens) — but the colon is
+# REQUIRED and only [ \t] may follow: this regex runs against a partially
+# streamed buffer, so an optional colon matches before the ":" token
+# arrives (leaking it into the transcript) and \s* would let a newline
+# delta terminate an empty transcript line.
+TRANSCRIPT_TAG_RE = re.compile(r"#{2,}[ \t]*TRANSCRIPT[ \t]*:[ \t]*", re.IGNORECASE)
 SENTENCE_END_RE = re.compile(r"[.!?]+\s")
 MAX_OUTPUT_TOKENS = 256
 
@@ -93,7 +95,8 @@ def pad_tail_silence(b64: str) -> str:
     with wave.open(io.BytesIO(base64.b64decode(b64)), "rb") as w:
         params = w.getparams()
         frames = w.readframes(w.getnframes())
-    frames += b"\x00" * (2 * int(TAIL_SILENCE_S * params.framerate))
+    frames += b"\x00" * (params.sampwidth * params.nchannels
+                         * int(TAIL_SILENCE_S * params.framerate))
     buf = io.BytesIO()
     with wave.open(buf, "wb") as out:
         out.setparams(params)
@@ -101,44 +104,79 @@ def pad_tail_silence(b64: str) -> str:
     return base64.b64encode(buf.getvalue()).decode()
 
 
+# ── websocket protocol ────────────────────────────────────────────────────
+
+async def send_json(ws, payload: dict) -> None:
+    await ws.send_text(json.dumps(payload))
+
+
+async def release_client(ws) -> None:
+    """Terminal frame for a turn that produced nothing. Without it the client
+    sits in 'processing' until its watchdog fires."""
+    await send_json(ws, {"type": "turn_final", "transcription": None,
+                         "timings": {}, "spoke": False})
+
+
 # ── streaming turn parser ─────────────────────────────────────────────────
 
 class StreamParser:
-    """Incrementally parses '<response>\\n###TRANSCRIPT: <words>'.
+    """Incrementally parses '###TRANSCRIPT: <words>\\n<response>'.
 
-    feed() returns complete response sentences as they become available;
-    finalize() returns the trailing partial sentence and the transcript.
+    The transcript line LEADS: the model commits to what it heard before
+    answering. Generating it after the response instead makes it a
+    paraphrase from memory — measured WER 0.39 vs 0.00 on a clean 33-word
+    utterance — and the leading line lets the client show what was heard
+    while the response is still decoding.
+
+    feed() returns complete response sentences as they become available
+    (transcript-line deltas return none); finalize() returns the trailing
+    partial sentence and the transcript. With expect_transcript=False
+    (text/image turns) the reply streams directly and any imitated
+    trailing tag is cut, never spoken.
     """
 
-    # Hold back enough of the tail to never TTS a partially-arrived tag.
-    TAG_HOLDBACK = len(TRANSCRIPT_TAG) + 4
-
-    def __init__(self):
+    def __init__(self, expect_transcript: bool = True):
         self.response = ""
-        self.transcript = ""
-        self._in_transcript = False
+        self.transcript: str | None = None
+        self._awaiting = expect_transcript
+        self._got_tag = False
+        self._buf = ""
+        self._before_tag = ""  # stray text before the tag → response prefix
         self._emitted = 0
 
     def feed(self, delta: str) -> list[str]:
-        if self._in_transcript:
-            self.transcript += delta
-            return []
-
-        self.response += delta
-        m = TRANSCRIPT_TAG_RE.search(self.response)
-        if m:
-            self.transcript = self.response[m.end():]
-            self.response = self.response[:m.start()]
-            self._in_transcript = True
+        if self._awaiting:
+            self._buf += delta
+            if not self._got_tag:
+                m = TRANSCRIPT_TAG_RE.search(self._buf)
+                if not m:
+                    return []
+                self._got_tag = True
+                self._before_tag = self._buf[:m.start()]
+                self._buf = self._buf[m.end():]
+            # A leading "\n" delta must not terminate an empty transcript.
+            self._buf = self._buf.lstrip()
+            newline = self._buf.find("\n")
+            if newline == -1:
+                if len(self._buf) < 600:
+                    return []
+                # Runaway transcript line: take the first sentence and stream
+                # the rest, rather than holding TTS hostage.
+                m = SENTENCE_END_RE.search(self._buf)
+                newline = m.end() - 1 if m else len(self._buf) - 1
+            self.transcript = self._buf[:newline].strip() or None
+            self.response = (self._before_tag + self._buf[newline + 1:]).lstrip()
+            self._awaiting = False
+            self._buf = ""
+        else:
+            self.response += delta
         return self._complete_sentences()
 
     def _complete_sentences(self) -> list[str]:
+        # The model occasionally imitates tag-like "##…" markup — never
+        # speak anything from one onwards.
         end = len(self.response)
-        if not self._in_transcript:
-            end = max(self._emitted, end - self.TAG_HOLDBACK)
-        # A malformed tag can slip past TRANSCRIPT_TAG_RE — still never
-        # speak anything from a "###" onwards.
-        hash_pos = self.response.find("###", self._emitted)
+        hash_pos = self.response.find("##", self._emitted)
         if hash_pos != -1:
             end = min(end, hash_pos)
         sentences = []
@@ -153,20 +191,32 @@ class StreamParser:
         return sentences
 
     def finalize(self) -> tuple[list[str], str | None]:
-        sentences = self.feed("")
-        # Cut any (possibly truncated) transcript tag — never speak it.
+        if self._awaiting:
+            if self._got_tag:
+                # No newline ever arrived (truncated stream / model ran the
+                # reply onto the tag line): first sentence is the transcript,
+                # the rest is the reply — never swallow it all silently.
+                m = SENTENCE_END_RE.search(self._buf)
+                cut = m.end() if m else len(self._buf)
+                self.transcript = self._buf[:cut].strip() or None
+                self.response = self._before_tag + self._buf[cut:]
+            else:
+                self.response = self._buf
+            self._awaiting = False
+        sentences = self._complete_sentences()
+        # Cut any imitated tag markup — never speak it.
         tail = re.split(r"#{2,}", self.response[self._emitted:])[0].strip()
-        transcript = self.transcript.strip() or None
-        return sentences + ([tail] if tail else []), transcript
+        return sentences + ([tail] if tail else []), self.transcript
 
 
 # ── turn execution ────────────────────────────────────────────────────────
 
 async def run_turn(ws, messages: list, interrupted: asyncio.Event,
-                   active: dict, tts_backend) -> str:
-    """Stream one model turn: decode → sentences → TTS, all pipelined.
-    Returns the raw generated text (stored verbatim in history so the next
-    request gets a full prefix-cache hit)."""
+                   active: dict, tts_backend, expect_transcript: bool = True) -> str:
+    """Stream one model turn: decode → sentences → TTS, all pipelined. The
+    transcript line is pushed to the client the moment it completes, while
+    the response is still decoding. Returns the raw generated text (stored
+    verbatim in history so the next request gets a full prefix-cache hit)."""
     loop = asyncio.get_event_loop()
     t0 = time.time()
     timings: dict = {}
@@ -204,28 +254,27 @@ async def run_turn(ws, messages: list, interrupted: asyncio.Event,
             if not audio_state["started"]:
                 audio_state["started"] = True
                 audio_state["first_audio_at"] = time.time()
-                await ws.send_text(json.dumps({
-                    "type": "audio_start",
-                    "sample_rate": tts_backend.sample_rate,
-                }))
+                await send_json(ws, {"type": "audio_start",
+                                     "sample_rate": tts_backend.sample_rate})
             pcm_int16 = (pcm * 32767).clip(-32768, 32767).astype(np.int16)
-            await ws.send_text(json.dumps({
+            await send_json(ws, {
                 "type": "audio_chunk",
                 "audio": base64.b64encode(pcm_int16.tobytes()).decode(),
                 "index": audio_state["chunks"],
-            }))
+            })
             audio_state["chunks"] += 1
 
     tts_task = asyncio.create_task(tts_worker())
-    parser = StreamParser()
+    parser = StreamParser(expect_transcript)
     tts_started_at = None
+    transcript_sent = False
 
     async def dispatch(sentences: list[str]):
         nonlocal tts_started_at
         for sentence in sentences:
             if tts_started_at is None:
                 tts_started_at = time.time()
-            await ws.send_text(json.dumps({"type": "text_delta", "text": sentence + " "}))
+            await send_json(ws, {"type": "text_delta", "text": sentence + " "})
             sentence_q.put_nowait(sentence)
 
     try:
@@ -239,6 +288,11 @@ async def run_turn(ws, messages: list, interrupted: asyncio.Event,
                 timings["prefill_s"] = round(time.time() - t0, 3)
             if not interrupted.is_set():
                 await dispatch(parser.feed(item))
+                if parser.transcript and not transcript_sent:
+                    transcript_sent = True
+                    timings["transcript_s"] = round(time.time() - t0, 3)
+                    await send_json(ws, {"type": "transcript",
+                                         "transcription": parser.transcript})
 
         tail, transcript = parser.finalize()
         timings["llm_time"] = round(time.time() - t0, 3)
@@ -269,17 +323,15 @@ async def run_turn(ws, messages: list, interrupted: asyncio.Event,
         print("Interrupted mid-turn")
         return raw["text"]
 
-    await ws.send_text(json.dumps({
+    await send_json(ws, {
         "type": "turn_final",
         "transcription": transcript,
         "timings": timings,
         "spoke": audio_state["started"],  # False → client must not wait for audio_end
-    }))
+    })
     if audio_state["started"]:
-        await ws.send_text(json.dumps({
-            "type": "audio_end",
-            "tts_time": timings.get("tts_time", 0),
-        }))
+        await send_json(ws, {"type": "audio_end",
+                             "tts_time": timings.get("tts_time", 0)})
     return raw["text"]
 
 

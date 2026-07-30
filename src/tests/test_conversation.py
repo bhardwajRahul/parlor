@@ -10,16 +10,12 @@ import time
 
 import fixtures as fx
 import pytest
-from util import wer
+from util import audio, wer
 
 # Transcripts of clean synthesized speech should be near-verbatim; degraded
 # audio gets more slack.
 WER_CLEAN = 0.15
 WER_DEGRADED = 0.25
-
-
-def audio(name: str) -> dict:
-    return {"audio": fx.load_wav_b64(name)}
 
 
 def ref_text(name: str) -> str:
@@ -49,7 +45,7 @@ def test_incomplete_utterance_is_held(session):
     t = session.turn(audio("incomplete_cutoff"))
     assert t.marker == "incomplete"
     assert t.audio_chunks == 0, "spoke a response to an unfinished thought"
-    assert (t.p_complete or 0) < 0.5
+    assert t.p_complete is not None and t.p_complete <= 0.5
 
 
 def test_continuation_merges_held_audio(session):
@@ -74,8 +70,9 @@ def test_flush_answers_a_held_turn(session):
     """After a hold the client flushes; the model answers what it has.
     Covers the false-hold path: a finished question must not die in silence."""
     t = session.turn(audio("long_question_male"))
-    if t.marker == "incomplete":  # expected: this voice trips the classifier
-        t = session.turn({"type": "flush"})
+    assert t.marker == "incomplete", \
+        "fixture no longer trips the classifier — pick a voice that does"
+    t = session.turn({"type": "flush"})
     assert t.marker == "complete"
     assert wer(ref_text("long_question"), t.transcription or "") <= WER_DEGRADED
     assert_spoken_prose(t.text)
@@ -97,13 +94,15 @@ def test_flush_on_genuine_trailoff(session):
 
 def test_chunked_speech_transcript_intact(server, session):
     chunks = fx.load_wav_chunks_b64("long_question")
+    primed_before = server.log().count("Primed cache")
     session.send_speech_chunks(chunks)
     t = session.turn({"audio": chunks[-1], "chunked": True}, timeout=120)
     assert t.marker == "complete"
     assert wer(ref_text("long_question"), t.transcription or "") <= WER_CLEAN
     assert_spoken_prose(t.text)
     if server.log_path:
-        assert "Primed cache" in server.log(), "chunk streaming never primed the cache"
+        primed = server.log().count("Primed cache") - primed_before
+        assert primed >= len(chunks) - 1, f"only {primed} chunks primed the cache"
 
 
 # ── D. Camera ─────────────────────────────────────────────────────────────
@@ -166,7 +165,7 @@ def test_multi_turn_memory(session):
     assert t.marker == "complete"
     t = session.turn(audio("name_recall"))
     assert t.marker == "complete"
-    assert "alex" in t.text.lower(), f"forgot the name: {t.text!r}"
+    assert "willow" in t.text.lower(), f"forgot the name: {t.text!r}"
 
 
 def test_text_only_turn(session):

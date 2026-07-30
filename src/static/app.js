@@ -17,6 +17,15 @@ let streamSampleRate = 24000;
 let streamNextTime = 0;         // When to schedule next chunk
 let streamSources = [];         // Active AudioBufferSourceNodes
 
+// Per-state [glow, glow-dim]. Resolved values, not nested var(): setState
+// writes them into CSS custom properties and the waveform paints with them.
+const STATE_COLORS = {
+  listening: ['#4ade80', 'rgba(74,222,128,0.12)'],
+  processing: ['#f59e0b', 'rgba(245,158,11,0.12)'],
+  speaking: ['#818cf8', 'rgba(129,140,248,0.12)'],
+  loading: ['#3a3d46', 'rgba(58,61,70,0.12)'],
+};
+
 // ── Waveform Visualizer ──
 let analyser, micSource;
 const BAR_COUNT = 40;
@@ -32,19 +41,12 @@ function initWaveformCanvas() {
   waveformCtx.scale(dpr, dpr);
 }
 
-function getStateColor() {
-  const colors = { listening: '#4ade80', processing: '#f59e0b', speaking: '#818cf8', loading: '#3a3d46' };
-  return colors[state] || colors.loading;
-}
-
 function drawWaveform() {
-  const w = waveformCanvas.getBoundingClientRect().width;
-  const h = waveformCanvas.getBoundingClientRect().height;
+  const { width: w, height: h } = waveformCanvas.getBoundingClientRect();
   waveformCtx.clearRect(0, 0, w, h);
 
   const barWidth = (w - (BAR_COUNT - 1) * BAR_GAP) / BAR_COUNT;
-  const color = getStateColor();
-  waveformCtx.fillStyle = color;
+  waveformCtx.fillStyle = (STATE_COLORS[state] || STATE_COLORS.loading)[0];
 
   let dataArray = null;
   if (analyser) {
@@ -103,15 +105,15 @@ function updateSpeakingGlow() {
 }
 
 // ── State Machine ──
+let processingWatchdog = null;
+
 function setState(newState) {
   state = newState;
 
-  // Update state indicator
   stateDot.className = `dot ${newState}`;
   const labels = { loading: 'Loading...', listening: 'Listening', processing: 'Thinking...', speaking: 'Speaking' };
   stateText.textContent = labels[newState] || newState;
 
-  // Update viewport glow class
   viewportWrap.className = `viewport-wrap ${newState}`;
 
   // Reset inline styles from speaking glow
@@ -120,18 +122,10 @@ function setState(newState) {
     viewportWrap.querySelector('.viewport-glow').style.boxShadow = '';
   }
 
-  // Update CSS custom properties for state color (must use resolved values, not nested var())
-  const stateVars = {
-    listening: ['#4ade80', 'rgba(74,222,128,0.12)'],
-    processing: ['#f59e0b', 'rgba(245,158,11,0.12)'],
-    speaking: ['#818cf8', 'rgba(129,140,248,0.12)'],
-    loading: ['#3a3d46', 'rgba(58,61,70,0.12)'],
-  };
-  const [glow, glowDim] = stateVars[newState] || stateVars.loading;
+  const [glow, glowDim] = STATE_COLORS[newState] || STATE_COLORS.loading;
   document.documentElement.style.setProperty('--glow', glow);
   document.documentElement.style.setProperty('--glow-dim', glowDim);
 
-  // Kick off speaking glow animation
   if (newState === 'speaking') requestAnimationFrame(updateSpeakingGlow);
 
   // Raise VAD threshold during speaking to reduce echo false triggers
@@ -139,7 +133,6 @@ function setState(newState) {
     myvad.setOptions({ positiveSpeechThreshold: newState === 'speaking' ? 0.92 : 0.5 });
   }
 
-  // Connect/disconnect mic analyser based on state
   if (newState === 'listening' && mediaStream && audioCtx && analyser) {
     if (!micSource) {
       micSource = audioCtx.createMediaStreamSource(mediaStream);
@@ -156,15 +149,22 @@ function setState(newState) {
     processingWatchdog = setTimeout(() => {
       if (state === 'processing') {
         console.warn('processing watchdog fired — returning to listening');
-        setState('listening');
-        setStatus('connected', 'Connected');
+        goListening();
       }
     }, 30000);
   }
 }
-let processingWatchdog = null;
+
+function goListening() { setState('listening'); setStatus('connected', 'Connected'); }
+function goProcessing() { setState('processing'); setStatus('processing', 'Processing'); }
 
 // ── WebSocket ──
+function wsOpen() { return ws && ws.readyState === WebSocket.OPEN; }
+
+function wsSend(payload) {
+  if (wsOpen()) ws.send(JSON.stringify(payload));
+}
+
 function connect() {
   ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
   ws.onopen = () => {
@@ -188,28 +188,22 @@ function connect() {
       // stay silent, flush the held audio so the model answers anyway.
       if (ignoreIncomingAudio) { ignoreIncomingAudio = false; return; }
       removeLastUserLoading();
-      setState('listening');
-      setStatus('connected', 'Connected');
+      serverHoldingAudio = true;
+      goListening();
       startFlushTimer();
+    } else if (msg.type === 'transcript') {
+      // The transcript line leads the model's reply, so what you said
+      // appears while the response is still decoding.
+      if (ignoreIncomingAudio) return;
+      fillUserBubble(msg.transcription);
     } else if (msg.type === 'turn_final') {
       if (ignoreIncomingAudio) return;
-      const userMsgs = messagesDiv.querySelectorAll('.msg.user');
-      const lastUserMsg = userMsgs[userMsgs.length - 1];
-      if (lastUserMsg && lastUserMsg.querySelector('.loading-dots')) {
-        const meta = lastUserMsg.querySelector('.meta');
-        lastUserMsg.innerHTML = `${msg.transcription || '…'}${meta ? meta.outerHTML : ''}`;
-      }
+      fillUserBubble(msg.transcription);
       const t = msg.timings || {};
       if (t.llm_time) {
         setAssistantMeta(`LLM ${t.llm_time}s` + (t.ttfa_s ? ` · audio @ ${t.ttfa_s}s` : ''));
       }
-      if (!msg.spoke) {
-        // No audio will follow — return to listening now.
-        setState('listening');
-        setStatus('connected', 'Connected');
-      }
-    } else if (msg.type === 'frame_failed') {
-      framePrefetched = false; // fall back to attaching the image inline
+      if (!msg.spoke) goListening();  // no audio will follow
     } else if (msg.type === 'audio_start') {
       if (ignoreIncomingAudio) return;
       streamSampleRate = msg.sample_rate || 24000;
@@ -231,6 +225,7 @@ function connect() {
 }
 
 // ── Streamed assistant message helpers ──
+const LOADING_DOTS = '<span class="loading-dots"><span></span><span></span><span></span></span>';
 let currentAssistantEl = null;
 let currentAssistantBodyEl = null;
 
@@ -263,22 +258,38 @@ function removeLastUserLoading() {
   if (last && last.querySelector('.loading-dots')) last.remove();
 }
 
+// Replace the last user bubble's loading dots with the heard words (no-op if
+// already filled — the early 'transcript' frame wins over turn_final's copy).
+function fillUserBubble(transcription) {
+  const userMsgs = messagesDiv.querySelectorAll('.msg.user');
+  const last = userMsgs[userMsgs.length - 1];
+  if (last && last.querySelector('.loading-dots')) {
+    const meta = last.querySelector('.meta');
+    last.innerHTML = `${transcription || '…'}${meta ? meta.outerHTML : ''}`;
+  }
+}
+
 // ── Flush timer: an incomplete turn went quiet — have the model answer the
 // held audio anyway (it asks the user to continue if the words really are
-// unfinished). Self-limiting: one flush per hold.
+// unfinished). Self-limiting: one flush per hold. serverHoldingAudio tracks
+// the held state so a cleared timer (VAD misfire, barge-in) can re-arm —
+// otherwise a cough after a false hold strands the question in silence.
 let flushTimer = null;
+let serverHoldingAudio = false;
 
 function startFlushTimer() {
   clearFlushTimer();
   flushTimer = setTimeout(() => {
     flushTimer = null;
-    if (state === 'listening' && ws && ws.readyState === WebSocket.OPEN) {
+    // Never flush over live speech — that utterance will consume the held
+    // audio itself when it ends.
+    if (state === 'listening' && !speechActive && wsOpen()) {
+      serverHoldingAudio = false;
       currentAssistantEl = null;
       ignoreIncomingAudio = false;
-      addMessage('user', '<span class="loading-dots"><span></span><span></span><span></span></span>');
-      ws.send(JSON.stringify({ type: 'flush' }));
-      setState('processing');
-      setStatus('processing', 'Processing');
+      addMessage('user', LOADING_DOTS);
+      wsSend({ type: 'flush' });
+      goProcessing();
     }
   }, 2500);
 }
@@ -290,19 +301,21 @@ function clearFlushTimer() {
 function setStatus(cls, text) { statusEl.className = `status-pill ${cls}`; statusEl.textContent = text; }
 
 // ── Camera ──
+const VIDEO_CONSTRAINTS = { width: 640, height: 480, facingMode: 'user' };
+const AUDIO_CONSTRAINTS = { echoCancellation: true, noiseSuppression: true, autoGainControl: true };
+
 async function startCamera() {
   try {
     mediaStream = await navigator.mediaDevices.getUserMedia({
-      video: { width: 640, height: 480, facingMode: 'user' },
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      video: VIDEO_CONSTRAINTS, audio: AUDIO_CONSTRAINTS,
     });
     video.srcObject = mediaStream;
     return;
   } catch (e) { console.warn('Video+audio failed:', e.message); }
 
   const streams = await Promise.allSettled([
-    navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480, facingMode: 'user' } }),
-    navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } }),
+    navigator.mediaDevices.getUserMedia({ video: VIDEO_CONSTRAINTS }),
+    navigator.mediaDevices.getUserMedia({ audio: AUDIO_CONSTRAINTS }),
   ]);
   mediaStream = new MediaStream();
   streams.forEach(r => { if (r.status === 'fulfilled') r.value.getTracks().forEach(t => mediaStream.addTrack(t)); });
@@ -348,8 +361,7 @@ function handleVadFrame(probs, frame) {
   bargeFrames = 0;
   if (speechActive && state === 'listening') {
     uttFrames.push(frame);
-    let total = 0;
-    for (const f of uttFrames) total += f.length;
+    const total = totalSamples(uttFrames);
     if (total - uttSamplesSent >= CHUNK_SECONDS * 16000) sendSpeechChunk(total);
   } else if (!speechActive) {
     preFrames.push(frame);
@@ -357,22 +369,25 @@ function handleVadFrame(probs, frame) {
   }
 }
 
-function concatFrames(frames) {
+function totalSamples(frames) {
   let total = 0;
   for (const f of frames) total += f.length;
-  const out = new Float32Array(total);
+  return total;
+}
+
+function concatFrames(frames) {
+  const out = new Float32Array(totalSamples(frames));
   let off = 0;
   for (const f of frames) { out.set(f, off); off += f.length; }
   return out;
 }
 
-function sendSpeechChunk(totalSamples) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  const all = concatFrames(uttFrames);
-  const chunk = all.subarray(uttSamplesSent, totalSamples);
+function sendSpeechChunk(upTo) {
+  if (!wsOpen()) return;
+  const chunk = concatFrames(uttFrames).subarray(uttSamplesSent, upTo);
   if (chunk.length < 4800) return; // <300ms — not worth a priming request
-  ws.send(JSON.stringify({ type: 'speech_chunk', seq: chunkSeq++, audio: float32ToWavBase64(chunk) }));
-  uttSamplesSent = totalSamples;
+  wsSend({ type: 'speech_chunk', seq: chunkSeq++, audio: float32ToWavBase64(chunk) });
+  uttSamplesSent = upTo;
 }
 
 function startUtteranceCapture() {
@@ -386,11 +401,10 @@ function startUtteranceCapture() {
 // image tokens while the user is still talking, so the audio turn only pays
 // for the audio (~75% faster first token on camera turns).
 function prefetchFrame() {
-  if (framePrefetched || !cameraEnabled) return;
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  if (framePrefetched || !cameraEnabled || !wsOpen()) return;
   const image = captureFrame();
   if (!image) return;
-  ws.send(JSON.stringify({ type: 'frame', image }));
+  wsSend({ type: 'frame', image });
   framePrefetched = true;
 }
 
@@ -408,9 +422,7 @@ function triggerBargeIn() {
   }
   stopPlayback();
   ignoreIncomingAudio = true;
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ type: 'interrupt' }));
-  }
+  wsSend({ type: 'interrupt' });
   setState('listening');
   prefetchFrame();
   startUtteranceCapture();
@@ -420,18 +432,17 @@ function triggerBargeIn() {
 function handleSpeechEnd(audio) {
   const wasStreaming = speechActive && uttSamplesSent > 0;
   speechActive = false; // always reset — a leak here streams mic audio forever
-  if (state !== 'listening') return;
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  if (state !== 'listening' || !wsOpen()) return;
 
   clearFlushTimer();
+  serverHoldingAudio = false;
   // Frame already prefetched at speech start; capture now only as fallback.
   const imageBase64 = framePrefetched ? null : captureFrame();
   const withCamera = framePrefetched || !!imageBase64;
   framePrefetched = false;
 
-  setState('processing');
-  setStatus('processing', 'Processing');
-  addMessage('user', '<span class="loading-dots"><span></span><span></span><span></span></span>', withCamera ? 'with camera' : '');
+  goProcessing();
+  addMessage('user', LOADING_DOTS, withCamera ? 'with camera' : '');
 
   currentAssistantEl = null;
   ignoreIncomingAudio = false;
@@ -439,15 +450,14 @@ function handleSpeechEnd(audio) {
   if (wasStreaming) {
     // Chunks already streamed — send only the un-sent tail (may be empty;
     // the server then responds from the streamed chunks alone).
-    const all = concatFrames(uttFrames);
-    const tail = all.subarray(uttSamplesSent);
+    const tail = concatFrames(uttFrames).subarray(uttSamplesSent);
     if (tail.length >= 1600) payload.audio = float32ToWavBase64(tail);
     payload.chunked = true;
   } else {
     payload.audio = float32ToWavBase64(audio);
   }
   if (imageBase64) payload.image = imageBase64;
-  ws.send(JSON.stringify(payload));
+  wsSend(payload);
 }
 
 // ── Float32 @ 16kHz → WAV base64 ──
@@ -518,7 +528,6 @@ function queueAudioChunk(base64Pcm) {
   const float32 = new Float32Array(int16.length);
   for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768;
 
-  // Create AudioBuffer and schedule it
   const audioBuffer = audioCtx.createBuffer(1, float32.length, streamSampleRate);
   audioBuffer.getChannelData(0).set(float32);
 
@@ -534,15 +543,10 @@ function queueAudioChunk(base64Pcm) {
 
   streamSources.push(source);
 
-  // Clean up when this chunk finishes
   source.onended = () => {
     const idx = streamSources.indexOf(source);
     if (idx !== -1) streamSources.splice(idx, 1);
-    // If this was the last chunk and no more are queued, return to listening
-    if (streamSources.length === 0 && state === 'speaking') {
-      setState('listening');
-      setStatus('connected', 'Connected');
-    }
+    if (streamSources.length === 0 && state === 'speaking') goListening();
   };
 }
 
@@ -570,7 +574,6 @@ async function init() {
   await startCamera();
   connect();
 
-  // Initialize VAD with shared mic stream
   myvad = await vad.MicVAD.new({
     getStream: async () => new MediaStream(mediaStream.getAudioTracks()),
     positiveSpeechThreshold: 0.5,
@@ -587,6 +590,7 @@ async function init() {
       // fresh frame instead of pointing the model at this stale one.
       framePrefetched = false;
       speechActive = false;
+      if (serverHoldingAudio) startFlushTimer();
       console.log('VAD misfire (too short)');
     },
     onFrameProcessed: (probs, frame) => handleVadFrame(probs, Float32Array.from(frame)),
@@ -611,8 +615,6 @@ async function init() {
   ensureAudioCtx();
 
   setState('listening');
-
-  // Start waveform loop
   drawWaveform();
 
   console.log('VAD initialized and listening');

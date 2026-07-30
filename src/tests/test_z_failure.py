@@ -6,7 +6,7 @@ child; every turn after that can only fail gracefully.
 
 import subprocess
 
-import fixtures as fx
+from util import audio
 
 
 def test_llama_death_fails_gracefully(server, session):
@@ -16,8 +16,8 @@ def test_llama_death_fails_gracefully(server, session):
     assert out, "could not find the spawned llama-server"
     subprocess.run(["kill", "-9", out[0]])
 
-    t = session.turn({"audio": fx.load_wav_b64("capital_france")}, timeout=30)
+    t = session.turn(audio("capital_france"), timeout=30)
     assert t.marker == "released", "client left hanging after llama-server died"
     # The server itself must survive to release the next attempt too.
-    t = session.turn({"audio": fx.load_wav_b64("capital_france")}, timeout=30)
+    t = session.turn(audio("capital_france"), timeout=30)
     assert t.marker == "released"

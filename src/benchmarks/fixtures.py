@@ -18,56 +18,55 @@ import numpy as np
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 TARGET_SR = 16000
 
-# name -> (spoken text, keywords expected in the transcript, expected turn kind)
+# name -> (spoken text, keywords expected in the transcript). The keywords are
+# read by the frozen experiment_*.py scripts; the e2e suite asserts on the
+# spoken text via word error rate instead.
 FIXTURES = {
     "capital_france": (
         "What is the capital of France?",
         ["capital", "france"],
-        "complete",
     ),
     "long_question": (
         "I have been trying to learn English for a few months now, and I "
         "wonder if you could give me some advice on how to improve my "
         "pronunciation when I speak with other people.",
         ["english", "pronunciation"],
-        "complete",
     ),
-    # Truncated mid-utterance (see generate_all) so the audio cuts off
-    # abruptly, like a real interrupted speaker — TTS of a trailing-off
-    # sentence otherwise sounds politely finished.
+    # Truncated mid-utterance (see BASE_KWARGS) so the audio cuts off abruptly,
+    # like a real interrupted speaker — TTS of a trailing-off sentence
+    # otherwise sounds politely finished.
     "incomplete_cutoff": (
         "So the thing I wanted to ask you about is the weather in Paris "
         "for my trip next week.",
         [],
-        "incomplete_short",
     ),
     "thinking_pause": (
         "That's a hard question. Hmm, let me think about it for a moment.",
         [],
-        "incomplete_long",
     ),
     "describe_scene": (
         "Can you describe what you can see right now?",
         ["see"],
-        "complete",
     ),
     # Continues incomplete_cutoff: held audio + this = the full question.
     "continuation": (
         "the weather in Paris for my trip next week.",
         ["paris"],
-        "complete",
     ),
+    # An uncommon name on purpose: asked cold, the model hallucinates "your
+    # name is Alex" often enough to break history-isolation assertions.
     "name_intro": (
-        "By the way, my name is Alex. It's nice to meet you!",
-        ["alex"],
-        "complete",
+        "By the way, my name is Willow. It's nice to meet you!",
+        ["willow"],
     ),
     "name_recall": (
         "Can you remind me what my name is?",
         ["name"],
-        "complete",
     ),
 }
+
+# Synthesis kwargs (see _synthesize) for base fixtures that need them.
+BASE_KWARGS = {"incomplete_cutoff": {"keep_frac": 0.55}}
 
 # Degraded re-recordings of base fixtures, reproducing live-mic conditions
 # clean synthesis can't: VAD-clipped word endings (the encoder hallucinates
@@ -120,8 +119,7 @@ def _synthesize(backend, text: str, *, voice: str = "af_heart", keep_frac: float
 
 
 def generate_all(force: bool = False) -> None:
-    specs = {n: (FIXTURES[n][0], {"keep_frac": 0.55} if n == "incomplete_cutoff" else {})
-             for n in FIXTURES}
+    specs = {n: (FIXTURES[n][0], BASE_KWARGS.get(n, {})) for n in FIXTURES}
     specs |= {n: (FIXTURES[base][0], kwargs) for n, (base, kwargs) in VARIANTS.items()}
     missing = [n for n in specs if force or not (FIXTURES_DIR / f"{n}.wav").exists()]
     if not missing:

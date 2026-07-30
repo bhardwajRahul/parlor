@@ -39,23 +39,47 @@ and what still needs human testing. Delete this file before merging.
      transcripts stay WER 0.0 on the clean fixtures.
    - The transcript tag is parsed tolerantly (`### TRANSCRIPT:` with a
      space was silently dropping correct transcripts).
+   - The transcript line now LEADS the reply. Measured (3 reps/cell, temp
+     0.7): trailing transcripts paraphrase long utterances (WER 0.39 on a
+     clean 33-word question vs 0.00 leading), and leading fully recovers
+     clipped endings. Grammar-forced JSON `{transcript, response}` (≈
+     main's tool call) was also measured: format breaks 1-3/3 on degraded
+     audio and 3/3 on chunked — structured output stays rejected. An
+     XML-style `<transcript>…</transcript>` scored identically to
+     `###TRANSCRIPT:` (24/24 format-intact each, same WER), so the hash
+     tag stays: its parser is unit-tested across delta boundaries and it
+     costs ~4 fewer tokens per turn. Cost of leading: the transcript's
+     decode time (~0.2s short / ~0.7s long) before first audio; the
+     client shows the heard words as soon as the line arrives.
 7. **Automated e2e suite** (`src/tests/`, `uv run pytest`) — covers
    turn-taking, chunked overlap, camera grounding/freshness, transcript WER
    (clean + degraded audio), memory, robustness (glitches, interrupts,
    queued turns, rotation, llama-server death). 19 tests, ~1 min + model
    load. `PARLOR_TEST_URL` runs it against a live server.
 
+8. **Model size switch** — `MODEL=e2b|e4b|12b` picks among Google's QAT
+   q4_0 GGUFs (E2B default). The llama.cpp chat template was verified
+   current: the GGUF embeds the 2026-07-09 canonical template
+   byte-identical to the upstream tool-calling fix
+   (google/gemma-4-E2B-it#35), and llama-server ≥b10150 applies it via
+   jinja by default — nothing to update.
+
 ## Measured (M3 Pro, `benchmarks/results/`)
 
 End of utterance → first audio heard; add ~200ms VAD on top. Baseline is the
-pre-session litert build.
+pre-session litert build; "Now" includes the leading transcript's decode
+time (`transcript_first.json` vs `after_quality_fixes.json` isolates that
+cost: +0.1s short, +0.7-0.8s long — bought back as transcript accuracy, and
+total turn time on long questions actually improved since TTS overlaps the
+remaining decode). E4B (`e4b_latency.json`): ~1.8x E2B — a viable quality
+fallback, still ~3x faster than baseline.
 
-| Turn                        | Baseline | Now       |
+| Turn                        | Baseline | Now (E2B) |
 | --------------------------- | -------- | --------- |
-| Short question              | 1.52s    | ~0.6s     |
-| Short + camera              | 1.94s    | ~0.7s     |
-| Long question (9.4s speech) | 2.91s    | ~0.7-0.9s |
-| Long + camera               | 2.98s    | ~0.8-1.0s |
+| Short question              | 1.52s    | ~0.7s     |
+| Short + camera              | 1.94s    | ~0.8s     |
+| Long question (9.4s speech) | 2.91s    | ~1.3-1.4s |
+| Long + camera               | 2.98s    | ~1.5s     |
 
 Reproduce: `uv run server.py`, then
 `uv run python benchmarks/bench.py --label X --out benchmarks/results/X.json`.
