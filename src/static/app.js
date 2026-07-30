@@ -193,20 +193,21 @@ function connect() {
       // and the eventual merged transcript will fill it.
       serverHoldingAudio = true;
       const held = pendingUserBubble();
-      if (held) setBubbleMeta(held, `paused · finished ${Math.round((msg.p_complete ?? 0) * 100)}%`);
+      if (held) setBubbleMeta(held,
+        `sounds unfinished (${Math.round((msg.p_complete ?? 0) * 100)}%) — still listening`);
       goListening();
       startFlushTimer();
     } else if (msg.type === 'transcript') {
       // The transcript line leads the model's reply, so what you said
       // appears while the response is still decoding.
       if (ignoreIncomingAudio) return;
-      fillUserBubble(msg.transcription, msg.p_complete);
+      fillUserBubble(msg.transcription);
     } else if (msg.type === 'turn_final') {
       if (ignoreIncomingAudio) return;
       if (!msg.spoke && !msg.transcription) {
         removeLastUserLoading();  // glitch/empty turn — nothing was heard
       } else {
-        fillUserBubble(msg.transcription, msg.p_complete);
+        fillUserBubble(msg.transcription);
       }
       const t = msg.timings || {};
       if (t.llm_time) {
@@ -293,14 +294,14 @@ function setBubbleMeta(bubble, extra) {
   meta.textContent = parts.join(' · ');
 }
 
-// Replace the last user bubble's loading dots with the heard words plus the
-// turn detector's confidence (no-op if already filled — the early
-// 'transcript' frame wins over turn_final's copy).
-function fillUserBubble(transcription, pComplete) {
+// Replace the last user bubble's loading dots with the heard words (no-op
+// if already filled — the early 'transcript' frame wins over turn_final's
+// copy). Also clears any 'sounds unfinished' hold meta: the turn resolved.
+function fillUserBubble(transcription) {
   const bubble = pendingUserBubble();
   if (!bubble) return;
   bubble.textContent = transcription || '…';
-  setBubbleMeta(bubble, pComplete != null ? `finished ${Math.round(pComplete * 100)}%` : '');
+  setBubbleMeta(bubble, '');
 }
 
 // ── Flush timer: an incomplete turn went quiet — have the model answer the
