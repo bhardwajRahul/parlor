@@ -5,13 +5,8 @@ key — so these tests exercise the full production path: audio in →
 <delegate> tag → background HTTP call → idle-gated delivery turn.
 """
 
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-import util  # noqa: E402
-from conftest import MOCK_ANSWER  # noqa: E402
+import util
+from conftest import MOCK_ANSWER
 
 
 def delegate_turn(session, fixture):

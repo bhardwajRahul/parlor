@@ -1,7 +1,7 @@
 """End-to-end latency benchmark — connects to the running server over WebSocket.
 
-Start the server first:  uv run python server.py
-Then run:                uv run python benchmarks/bench.py --label baseline --out results/baseline.json
+Start the server first:  uv run parlor
+Then run:                uv run python benchmarks/bench.py --label baseline --out benchmarks/results/baseline.json
 
 Uses real spoken audio (see fixtures.py). Measures client-perceived latency:
 t0 is the moment the utterance is sent (≈ VAD speech-end in real usage; the

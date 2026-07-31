@@ -14,8 +14,8 @@ wheels/
 *.litertlm
 
 # Generated benchmark artifacts
-src/benchmarks/fixtures/
-src/benchmarks/results/
+benchmarks/fixtures/
+benchmarks/results/
 
 # macOS
 .DS_Store

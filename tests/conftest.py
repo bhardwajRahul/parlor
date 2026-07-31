@@ -21,10 +21,9 @@ from pathlib import Path
 
 import pytest
 
-SRC = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(SRC / "benchmarks"))
+import fixtures  # resolved via pythonpath = ["benchmarks"] (pyproject.toml)
 
-import fixtures  # noqa: E402
+ROOT = Path(__file__).resolve().parent.parent
 
 TEST_PORT = 8821
 TEST_LLAMA_PORT = 8822
@@ -146,8 +145,8 @@ def server(tmp_path_factory, reasoner_mock) -> Server:
            "REASONER_TIMEOUT": "20"}
     env.pop("LLAMA_SERVER_URL", None)
     with open(log_path, "w") as log:
-        proc = subprocess.Popen([sys.executable, "server.py"], cwd=SRC, env=env,
-                                stdout=log, stderr=subprocess.STDOUT)
+        proc = subprocess.Popen([sys.executable, "-m", "parlor.server"], cwd=ROOT,
+                                env=env, stdout=log, stderr=subprocess.STDOUT)
 
     def shutdown():
         # server.py's lifespan stops its llama-server child on SIGTERM, but a

@@ -12,7 +12,7 @@ import wave
 
 import numpy as np
 
-import llama
+from parlor import llama
 
 # Parsed tolerantly ("### TRANSCRIPT : ..." happens) — but the colon is
 # REQUIRED and only [ \t] may follow: this regex runs against a partially

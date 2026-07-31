@@ -8,14 +8,9 @@ lesson in transcribing from nothing), and tiny histories pass through
 untouched (slicing a bare [system] would duplicate the system prompt).
 """
 
-import sys
-from pathlib import Path
-
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from server import rotate_history  # noqa: E402
+from parlor.server import rotate_history
 
 
 def make_history(pairs: int) -> list:

@@ -6,14 +6,9 @@ when the tag, colon, or newline arrives as its own token (which is exactly
 how llama.cpp streams them).
 """
 
-import sys
-from pathlib import Path
-
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from pipeline import StreamParser, echoes_instruction  # noqa: E402
+from parlor.pipeline import StreamParser, echoes_instruction
 
 
 def run(deltas, expect_transcript=True):
@@ -294,7 +289,7 @@ def test_streaming_matches_batch_for_every_split_point_with_tags(text):
 # with the turn's instruction.
 
 def test_instruction_echo_is_detected_against_production_prompts():
-    import server
+    from parlor import server
     flush = server.FLUSH_PROMPT.format(camera="")
     # The observed leak: instruction text verbatim (with or without the
     # model tacking invented words on the end).
@@ -307,7 +302,7 @@ def test_instruction_echo_is_detected_against_production_prompts():
 
 
 def test_genuine_transcripts_pass_the_echo_guard():
-    import server
+    from parlor import server
     for prompt in (server.FLUSH_PROMPT.format(camera=""),
                    server.RESPOND_PROMPT.format(camera=""),
                    server.TRANSLATE_PROMPT):
@@ -326,7 +321,7 @@ def test_production_filter_knows_every_control_tag():
     # incite: a name it doesn't know is released as speech, so a narrowed
     # per-mode set would read task text aloud (found in review — modes must
     # gate acting on tags, never parsing them).
-    import server
+    from parlor import server
     assert set(n.lower() for n in server.CONTROL_TAGS) == {"delegate", "mode"}
 
 
@@ -342,7 +337,7 @@ def test_no_speech_annotations_are_not_user_words():
     # A transcript that is entirely a bracketed annotation reports that
     # there were no words — shown/stored as user speech it becomes a
     # hallucination ('[Silence]' appeared as a user bubble, live).
-    from pipeline import NO_SPEECH_RE
+    from parlor.pipeline import NO_SPEECH_RE
     for t in ["(no speech)", "(No Speech)", "no speech", "No speech.",
               "(noise)", "[Silence]", "*sigh*", "(background noise)",
               "(static hum)", "[inaudible]"]:
@@ -362,7 +357,7 @@ def test_quoted_prompt_phrases_are_not_echoes():
     # genuine "go back to normal conversation" must not read as an
     # instruction echo (pre-fix it did, and the no-transcript tag gate
     # then dropped the <mode>conversation</mode> exit).
-    import server
+    from parlor import server
     said = "Okay, stop translating now and go back to normal conversation."
     assert not echoes_instruction(said, server.TRANSLATE_PROMPT)
     # Unquoted instruction prose still reads as an echo.
