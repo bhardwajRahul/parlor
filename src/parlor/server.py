@@ -111,7 +111,8 @@ TRANSLATE_PROMPT = (
 # and gave the anti-echo response instead of the answer (observed live).
 DELIVER_PROMPT = (
     "System note (not user audio): your background research assistant "
-    'just finished the task "{task}". Its answer:\n{answer}\n\n'
+    'just finished the task "{task}" (it took {took}). Its answer:\n'
+    "{answer}\n\n"
     "Tell the user now: one short lead-in sentence tying it back to what "
     "they asked, then the answer itself word-for-word. Never drop or "
     "change a name, number, or place — the words above are already "
@@ -200,6 +201,40 @@ FLUSH_PROMPT = (
     "short sentences, spoken aloud.{camera}"
 )
 
+# A sense of elapsed time. The model can't perceive silence between
+# turns, so when a real gap precedes an utterance the turn instruction
+# says so — in the per-turn tail (never the system prompt: that's the
+# prefix-cache prefix), and only on audio turns (a text turn's
+# instruction IS the user's typed words). Coarse buckets on purpose:
+# exact numbers read as data the model parrots back awkwardly.
+try:
+    TIME_NOTE_MIN_S = float(os.environ.get("TIME_NOTE_MIN_S", "120"))
+except ValueError:
+    print("TIME_NOTE_MIN_S is not a number — using 120s")
+    TIME_NOTE_MIN_S = 120.0
+TIME_NOTE = " (Time note: {phrase} of quiet passed before this message.)"
+
+# The model has no clock; the start time anchors rough what-time-is-it
+# awareness. Formatted ONCE at connect — never re-formatted mid-session.
+SESSION_CLOCK = " This conversation started on {clock}."
+
+
+def elapsed_phrase(seconds: float) -> str:
+    """'a few seconds' / 'about 20 seconds' / 'about a minute' /
+    'about N minutes' / 'about an hour' / 'about N hours'."""
+    if seconds < 10:
+        return "a few seconds"
+    if seconds < 45:
+        return f"about {round(seconds / 10) * 10} seconds"
+    if seconds < 90:
+        return "about a minute"
+    if seconds < 55 * 60:
+        return f"about {round(seconds / 60)} minutes"
+    if seconds < 90 * 60:
+        return "about an hour"
+    return f"about {round(seconds / 3600)} hours"
+
+
 # Rotate history before the llama context fills. Rough token estimates are
 # fine here — the guard just needs to fire before generation degrades.
 # Scaled to the context size: a fixed 2000 against the suite's small
@@ -272,7 +307,9 @@ async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
 
     delegation = reasoner.enabled()
-    system = SYSTEM_PROMPT + (DELEGATE_INSTRUCTION if delegation else "")
+    clock = time.strftime("%A at %I:%M %p").replace(" 0", " ")
+    system = (SYSTEM_PROMPT + SESSION_CLOCK.format(clock=clock)
+              + (DELEGATE_INSTRUCTION if delegation else ""))
     history: list = [{"role": "system", "content": system}]
     mode = MODES["conversation"]
 
@@ -327,6 +364,10 @@ async def websocket_endpoint(ws: WebSocket):
     delegation_tasks: set[asyncio.Task] = set()
     ready_delegations: list[dict] = []  # finished while the floor was busy
     playing_since = {"t": 0.0}  # last spoken reply is (probably) still playing
+    # When the line was last live — an exchange ending, or the user's
+    # speech streaming in (so a long monologue doesn't read as a long
+    # silence). The gap since it is the "quiet" the time note reports.
+    last_activity = {"t": time.time()}
     prompt_tokens = {"last": 0}  # real context size, from llama-server usage
 
     def floor_busy() -> bool:
@@ -385,6 +426,7 @@ async def websocket_endpoint(ws: WebSocket):
     async def run_delegation(task_id: int, task: str) -> None:
         """Background reasoner call; its outcome re-enters the main loop
         through msg_queue so delivery is serialized with real turns."""
+        t0 = time.time()
         try:
             answer = await asyncio.get_event_loop().run_in_executor(
                 REASONER_POOL, reasoner.ask, task)
@@ -397,7 +439,8 @@ async def websocket_endpoint(ws: WebSocket):
             print(f"Delegation #{task_id} failed: {e}")
             outcome = {"ok": False, "answer": ""}
         await msg_queue.put({"type": "delegation_done", "id": task_id,
-                             "task": task, **outcome})
+                             "task": task, "took_s": round(time.time() - t0, 1),
+                             **outcome})
 
     async def spawn_delegations(tags: list[tuple[str, str]]) -> list:
         """Returns the delegate tags that did NOT fire (for history
@@ -443,7 +486,8 @@ async def websocket_endpoint(ws: WebSocket):
         await send_json(ws, {"type": "delegation_resolved",
                              "id": done["id"], "ok": done["ok"]})
         prompt = (DELIVER_PROMPT if done["ok"] else DELIVER_FAILED_PROMPT).format(
-            task=done["task"], answer=done["answer"])
+            task=done["task"], answer=done["answer"],
+            took=elapsed_phrase(done.get("took_s", 0.0)))
         user_msg = {"role": "user", "content": [text_part(prompt)]}
         # expect_transcript=True although there is no audio: the model
         # often opens a delivery with an imitated ###TRANSCRIPT: line, and
@@ -465,6 +509,7 @@ async def websocket_endpoint(ws: WebSocket):
         unfired = await spawn_delegations(tags)  # a delivery may chain research
         unfired += [(n, v) for n, v in tags if n == "MODE"]  # never applied here
         remember(user_msg, strip_unfired_tags(raw_text, unfired), no_speech=False)
+        last_activity["t"] = time.time()
         drain_ready()                  # more results may already be waiting
 
     async def prime(audio_b64s: list[str]) -> None:
@@ -503,6 +548,7 @@ async def websocket_endpoint(ws: WebSocket):
                 # the client cleared its own frame-discard flag before
                 # sending this, so delivering now is safe.
                 playing_since["t"] = 0.0
+                last_activity["t"] = time.time()
                 interrupted.clear()
                 drain_ready()
                 continue
@@ -549,6 +595,7 @@ async def websocket_endpoint(ws: WebSocket):
                     speech_chunks = []
                 if valid_audio(msg.get("audio")):
                     speech_chunks.append(msg["audio"])
+                    last_activity["t"] = time.time()
                     await prime(held_audio + speech_chunks)
                 continue
 
@@ -614,6 +661,11 @@ async def websocket_endpoint(ws: WebSocket):
                     instruction = turn_instruction(msg, bool(image), has_audio)
                     if has_audio:
                         instruction += MODE_SUFFIX
+                        gap = time.time() - last_activity["t"]
+                        if gap >= TIME_NOTE_MIN_S:
+                            phrase = elapsed_phrase(gap)
+                            instruction += TIME_NOTE.format(phrase=phrase)
+                            print(f"Time note: {phrase}")
                 user_msg = {"role": "user", "content": content + [text_part(instruction)]}
                 raw_text, tags, pt, no_speech = await run_turn(
                     ws, history + [user_msg], interrupted, active,
@@ -637,6 +689,7 @@ async def websocket_endpoint(ws: WebSocket):
                     unfired = await spawn_delegations(tags)
                     unfired += await apply_mode_tags(tags)
                 remember(user_msg, strip_unfired_tags(raw_text, unfired), no_speech)
+                last_activity["t"] = time.time()
             except DISCONNECT_ERRORS:
                 raise
             except Exception:

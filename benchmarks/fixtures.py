@@ -63,6 +63,11 @@ FIXTURES = {
         "Can you remind me what my name is?",
         ["name"],
     ),
+    # Elapsed-time e2e (tests/test_elapsed.py): asked after a real pause.
+    "how_long_quiet": (
+        "Roughly how long was I quiet just now?",
+        ["long"],
+    ),
     # Transcript-stability fillers (tests/test_transcription_stability.py):
     # each carries content words unique across the whole fixture set, so a
     # transcript that borrows another turn's words is provably written from

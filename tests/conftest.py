@@ -142,7 +142,11 @@ def server(tmp_path_factory, reasoner_mock) -> Server:
            "TEMPERATURE": os.environ.get("TEMPERATURE", "0"),
            "REASONER_BASE_URL": f"http://127.0.0.1:{TEST_REASONER_PORT}/v1",
            "REASONER_API_KEY": "test-key", "REASONER_MODEL": "mock-model",
-           "REASONER_TIMEOUT": "20"}
+           "REASONER_TIMEOUT": "20",
+           # Low enough for test_elapsed to trigger with a short sleep, high
+           # enough that ordinary inter-turn gaps (delegation retries idle up
+           # to 10s) never fire a note into unrelated pinned assertions.
+           "TIME_NOTE_MIN_S": "15"}
     env.pop("LLAMA_SERVER_URL", None)
     with open(log_path, "w") as log:
         proc = subprocess.Popen([sys.executable, "-m", "parlor.server"], cwd=ROOT,
