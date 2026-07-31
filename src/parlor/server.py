@@ -171,9 +171,20 @@ _WORD_NUMS = {
     "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
     "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15,
     "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19,
-    "twenty": 20, "thirty": 30, "forty": 40, "forty-five": 45, "fifty": 50,
-    "sixty": 60, "ninety": 90,
+    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60,
+    "seventy": 70, "eighty": 80, "ninety": 90,
 }
+
+
+def _word_number(raw: str) -> int:
+    """'twenty' → 20, 'forty-five' → 45; 0 when it isn't a number word.
+    Compounds are tens-hyphen-units, so 'forty-five' resolves without
+    enumerating every combination."""
+    if raw in _WORD_NUMS:
+        return _WORD_NUMS[raw]
+    tens, _, units = raw.partition("-")
+    t, u = _WORD_NUMS.get(tens, 0), _WORD_NUMS.get(units, 0)
+    return t + u if t >= 20 and t % 10 == 0 and 0 < u < 10 else 0
 _UNIT_S = {"h": 3600, "m": 60, "s": 1}
 TIMER_VALUE_RE = re.compile(
     r"(?P<num>\d+(?:\.\d+)?|[a-z]+(?:-[a-z]+)?)\s*"
@@ -192,7 +203,7 @@ def _duration_s(text: str) -> tuple[float, str] | None:
         try:
             num = float(raw)
         except ValueError:
-            num = _WORD_NUMS.get(raw, 0)
+            num = _word_number(raw)
         if num > 0:
             rest = (text[:m.start()] + text[m.end():]).strip()
             rest = re.sub(r"^(?:for|in)\b\s*(?:the\b\s*)?", "", rest,

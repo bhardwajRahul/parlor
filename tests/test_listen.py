@@ -35,7 +35,8 @@ def test_spoken_command_exits_listen_and_conversation_resumes(server, session):
     assert t.marker == "released", t
     # "What do you think about all of that?" is addressed TO the
     # assistant: it must exit AND speak, not get silently transcribed.
-    switch_by_voice(session, "cmd_stop_listen", "conversation")
+    exit_turn = switch_by_voice(session, "cmd_stop_listen", "conversation")
+    assert exit_turn.marker == "complete", exit_turn  # the exit turn SPOKE
     # Back to conversation: questions get answers again — the silently
     # stored turns didn't teach the model to stay quiet.
     t = session.turn(util.audio("capital_france"))

@@ -15,6 +15,8 @@ from parlor.server import parse_timer
     ("pasta | 3 minutes", (180, "pasta")),
     ("ten minutes", (600, "")),
     ("forty-five seconds | oven", (45, "oven")),
+    ("twenty-five minutes | pomodoro", (1500, "pomodoro")),
+    ("seventy seconds | eggs", (70, "eggs")),
     ("1.5 hours | roast", (5400, "roast")),
     ("half an hour | nap", (1800, "nap")),
     ("a minute | tea", (60, "tea")),
@@ -50,6 +52,7 @@ def test_timer_set_rings_and_speaks(server, session):
     server.require_managed()
     ack, started = set_timer_turn(session)
     assert 8 <= started["seconds"] <= 12, started
+    assert ack.marker == "complete", ack  # the confirmation is spoken
     assert "<" not in ack.text, ack.text  # the tag itself is never spoken
     resolved = session.wait_for("timer_resolved", timeout=30)
     assert resolved and not resolved.get("cancelled"), resolved

@@ -144,11 +144,12 @@ class Session:
             pass
 
 
-def switch_by_voice(session: Session, fixture: str, target: str, tries: int = 2):
+def switch_by_voice(session: Session, fixture: str, target: str,
+                    tries: int = 2) -> Turn:
     """Speak a mode-switch command and wait for the server to confirm it;
     like delegation tags, the model occasionally confirms without emitting
     the tag — one retry keeps the suite stable, two misses is a real
-    regression."""
+    regression. Returns the switching turn (callers assert on its reply)."""
     for _ in range(tries):
         t = session.turn(audio(fixture))
         if t.marker == "incomplete":
@@ -158,6 +159,6 @@ def switch_by_voice(session: Session, fixture: str, target: str, tries: int = 2)
             t = session.turn({"type": "flush"})
         changed = session.wait_for("mode_changed", timeout=10)
         if changed and changed.get("mode") == target:
-            return
+            return t
     raise AssertionError(
         f"never switched to {target!r} in {tries} tries — last reply {t.text!r}")
