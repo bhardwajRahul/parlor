@@ -57,9 +57,8 @@ cd parlor
 curl -LsSf https://astral.sh/uv/install.sh | sh
 brew install llama.cpp
 
-cd src
 uv sync
-uv run server.py
+uv run parlor
 ```
 
 Open [http://localhost:8000](http://localhost:8000), grant camera and microphone access, and start talking.
@@ -98,7 +97,7 @@ Measured with `MODEL=e2b` from end of utterance to first audio heard (add ~200ms
 Reproduce with the end-to-end benchmark (real spoken audio, synthesized locally). Run it before and after a change to see the impact:
 
 ```bash
-uv run server.py                 # terminal 1
+uv run parlor                    # terminal 1
 uv run python benchmarks/bench.py --label before --out benchmarks/results/before.json   # terminal 2
 # ...make changes, restart the server...
 uv run python benchmarks/bench.py --label after --out benchmarks/results/after.json
@@ -123,23 +122,21 @@ feel, multilingual speech) still needs a live mic and ears.
 ## Project structure
 
 ```
-src/
+src/parlor/
 ├── server.py              # FastAPI app + per-connection conversation loop
 ├── llama.py               # llama-server lifecycle + chat API client
 ├── pipeline.py            # Streaming turn pipeline (decode → sentences → TTS)
 ├── reasoner.py            # Background research delegation (OpenAI-compatible)
 ├── modes.py               # Session modes (conversation, translate)
 ├── turn_detector.py       # smart-turn-v3 end-of-turn classifier
-├── whisper_features.py    # Log-mel features for the turn detector
 ├── tts.py                 # Platform-aware TTS (MLX on Mac, ONNX on Linux)
-├── index.html             # Frontend markup
-├── static/                # Frontend styles + app logic (VAD, camera, playback)
-├── tests/                 # End-to-end test suite (uv run pytest)
-└── benchmarks/
-    ├── bench.py           # End-to-end latency benchmark
-    ├── fixtures.py        # Spoken-audio fixtures (synthesized locally)
-    ├── compare.py         # Diff two benchmark result files
-    └── turnbench.py       # Turn-detection accuracy benchmark
+└── web/                   # Frontend (markup, styles, app logic: VAD, camera, playback)
+tests/                     # End-to-end test suite (uv run pytest)
+benchmarks/
+├── bench.py               # End-to-end latency benchmark
+├── fixtures.py            # Spoken-audio fixtures (synthesized locally)
+├── compare.py             # Diff two benchmark result files
+└── turnbench.py           # Turn-detection accuracy benchmark
 ```
 
 ## Acknowledgments

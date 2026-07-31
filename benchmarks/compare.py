@@ -1,6 +1,6 @@
 """Compare two bench.py result files.
 
-Usage:  uv run python benchmarks/compare.py results/baseline.json results/after.json
+Usage:  uv run python benchmarks/compare.py benchmarks/results/baseline.json benchmarks/results/after.json
 """
 
 import json

@@ -40,13 +40,11 @@ DISCONNECT_ERRORS = (WebSocketDisconnect, ClientDisconnected)
 from dotenv import load_dotenv
 load_dotenv()  # before importing llama — it reads its config at import time
 
-import llama
-import reasoner
-import tts
-from modes import MODES
-from pipeline import (estimate_tokens, pad_tail_silence, prime_cache,
-                      release_client, run_turn, send_json, text_part,
-                      user_content, valid_audio, wav_to_float32)
+from parlor import llama, reasoner, tts
+from parlor.modes import MODES
+from parlor.pipeline import (estimate_tokens, pad_tail_silence, prime_cache,
+                             release_client, run_turn, send_json, text_part,
+                             user_content, valid_audio, wav_to_float32)
 
 # Turn completeness is judged by the smart-turn audio classifier before the
 # LLM is involved, so the prompt carries no FINISHED/WAIT machinery at all.
@@ -237,7 +235,7 @@ REASONER_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="reasoner")
 def load_models():
     global tts_backend, detector
     llama.start()
-    from turn_detector import TurnDetector
+    from parlor.turn_detector import TurnDetector
     detector = TurnDetector()
     tts_backend = tts.load()
 
@@ -250,12 +248,12 @@ async def lifespan(app):
 
 
 app = FastAPI(lifespan=lifespan)
-app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
+app.mount("/static", StaticFiles(directory=Path(__file__).parent / "web" / "static"), name="static")
 
 
 @app.get("/")
 async def root():
-    html = (Path(__file__).parent / "index.html").read_text()
+    html = (Path(__file__).parent / "web" / "index.html").read_text()
     return HTMLResponse(content=html.replace("{{model}}", llama.model_label()))
 
 
@@ -655,6 +653,10 @@ async def websocket_endpoint(ws: WebSocket):
             t.cancel()
 
 
-if __name__ == "__main__":
+def main() -> None:
     port = int(os.environ.get("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
+
+if __name__ == "__main__":
+    main()

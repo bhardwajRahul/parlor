@@ -48,8 +48,6 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
 import fixtures
 
 DATASET = "pipecat-ai/smart-turn-data-v3.2-test"
@@ -350,12 +348,10 @@ def main() -> None:
         os.environ["LLAMA_PORT"] = BENCH_PORT
 
     global llama, pipeline, server  # after the env above; llama reads LLAMA_PORT at import
-    import llama
-    import pipeline
-    import server
+    from parlor import llama, pipeline, server
     detector = None
     if "smart" in modes:
-        from turn_detector import TurnDetector
+        from parlor.turn_detector import TurnDetector
         detector = TurnDetector()
     if set(modes) - {"smart"}:
         llama.start()

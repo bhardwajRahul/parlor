@@ -25,17 +25,14 @@ import base64
 import json
 import os
 import re
-import sys
 import time
 from pathlib import Path
 
 os.environ.setdefault("LLAMA_PORT", "8099")
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
 import fixtures  # noqa: E402
-import llama  # noqa: E402
-from pipeline import StreamParser, audio_part, text_part  # noqa: E402
+from parlor import llama  # noqa: E402
+from parlor.pipeline import StreamParser, audio_part, text_part  # noqa: E402
 
 CACHE_DIR = Path(__file__).parent / "fixtures" / "tagbench"
 
@@ -95,7 +92,7 @@ SYNTAXES = {
 
 # Mirrors server.py's production prompts (imported so drift is impossible).
 def production_prompts():
-    import server
+    from parlor import server
     return (server.SYSTEM_PROMPT, server.RESPOND_PROMPT.format(camera=""),
             server.DELEGATE_INSTRUCTION)
 
@@ -106,7 +103,7 @@ def ensure_fixtures() -> dict[str, str]:
     missing = [n for n in cases if not (CACHE_DIR / f"{n}.wav").exists()]
     if missing:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        import tts
+        from parlor import tts
         backend = tts.load()
         for name in missing:
             pcm = fixtures._synthesize(backend, cases[name])

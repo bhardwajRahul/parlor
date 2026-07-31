@@ -204,8 +204,7 @@ def generate_all(force: bool = False) -> None:
     if not missing:
         return
     FIXTURES_DIR.mkdir(exist_ok=True)
-    sys.path.insert(0, str(Path(__file__).parent.parent))
-    import tts
+    from parlor import tts
 
     backend = tts.load()
     for name in missing:
