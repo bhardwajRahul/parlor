@@ -31,4 +31,10 @@ MODES = {m.name: m for m in [
     # and never mixes research or camera chatter into the rendering.
     Mode("translate", uses_smart_turn=False, allows_delegation=False,
          wants_camera=False, tts_voice="af_heart"),
+    # A silent scribe: the user thinks out loud, Parlor transcribes and
+    # stays quiet until spoken TO (the exit path lives in LISTEN_PROMPT).
+    # VAD-only segmentation — nothing gets answered, so utterance
+    # completeness never matters. Research deliveries park like translate.
+    Mode("listen", uses_smart_turn=False, allows_delegation=False,
+         wants_camera=False, tts_voice="af_heart"),
 ]}

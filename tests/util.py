@@ -142,3 +142,22 @@ class Session:
         """Read and discard messages until the line goes quiet."""
         while self.recv(timeout=quiet_s) is not None:
             pass
+
+
+def switch_by_voice(session: Session, fixture: str, target: str, tries: int = 2):
+    """Speak a mode-switch command and wait for the server to confirm it;
+    like delegation tags, the model occasionally confirms without emitting
+    the tag — one retry keeps the suite stable, two misses is a real
+    regression."""
+    for _ in range(tries):
+        t = session.turn(audio(fixture))
+        if t.marker == "incomplete":
+            # smart-turn held the command (conversation-mode gating):
+            # flush it rather than re-speaking, which would double the
+            # utterance into one merged turn.
+            t = session.turn({"type": "flush"})
+        changed = session.wait_for("mode_changed", timeout=10)
+        if changed and changed.get("mode") == target:
+            return
+    raise AssertionError(
+        f"never switched to {target!r} in {tries} tries — last reply {t.text!r}")

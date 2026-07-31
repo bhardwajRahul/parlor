@@ -120,9 +120,9 @@ def test_streaming_matches_batch_for_every_split_point():
 TAGS = ("delegate", "mode")
 
 
-def run_tags(deltas, expect_transcript=True):
+def run_tags(deltas, expect_transcript=True, control_tags=TAGS):
     """-> (spoken sentences, transcript, extracted tags)"""
-    p = StreamParser(expect_transcript, control_tags=TAGS)
+    p = StreamParser(expect_transcript, control_tags=control_tags)
     spoken = []
     for d in deltas:
         spoken += p.feed(d)
@@ -322,7 +322,19 @@ def test_production_filter_knows_every_control_tag():
     # per-mode set would read task text aloud (found in review — modes must
     # gate acting on tags, never parsing them).
     from parlor import server
-    assert set(n.lower() for n in server.CONTROL_TAGS) == {"delegate", "mode"}
+    assert set(n.lower() for n in server.CONTROL_TAGS) == {"delegate", "mode",
+                                                          "timer"}
+
+
+def test_timer_tag_extracted_never_spoken():
+    spoken, transcript, tags = run_tags(
+        ["###TRANSCRIPT: Set a timer for three minutes.\n",
+         "Okay, three minutes — I'll let you know. ",
+         "<timer>3 minutes | pasta</timer>"],
+        control_tags=("delegate", "mode", "timer"))
+    assert transcript == "Set a timer for three minutes."
+    assert spoken == ["Okay, three minutes — I'll let you know."]
+    assert tags == [("TIMER", "3 minutes | pasta")]
 
 
 def test_parser_without_control_tags_is_unchanged():

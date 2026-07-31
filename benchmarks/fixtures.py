@@ -135,7 +135,7 @@ FIXTURES = {
         "Please look up the current weather in Naples, Italy for me.",
         ["weather", "naples"],
     ),
-    # Mode-switch voice commands (translation e2e).
+    # Mode-switch voice commands (translation + listen e2e).
     "cmd_translate": (
         "From now on, please translate everything I say into English.",
         ["translate"],
@@ -143,6 +143,34 @@ FIXTURES = {
     "cmd_stop_translate": (
         "Okay, stop translating now and go back to normal conversation.",
         ["stop"],
+    ),
+    "cmd_listen": (
+        "From now on, please just listen quietly and don't respond. I "
+        "want to think out loud for a bit.",
+        ["listen"],
+    ),
+    "cmd_stop_listen": (
+        "Okay, I'm done thinking out loud. What do you think about all "
+        "of that?",
+        ["done"],
+    ),
+    # Timer e2e: short durations so the ring lands inside test timeouts;
+    # _alt phrasings decorrelate the retry like the delegation fixtures.
+    "cmd_timer_short": (
+        "Set a timer for ten seconds, please.",
+        ["timer"],
+    ),
+    "cmd_timer_short_alt": (
+        "Please give me a ten second timer.",
+        ["timer"],
+    ),
+    "cmd_timer_minute": (
+        "Please set a one minute timer for the tea.",
+        ["timer"],
+    ),
+    "cmd_timer_minute_alt": (
+        "Can you give me a one minute timer for the tea?",
+        ["timer"],
     ),
 }
 
@@ -156,6 +184,10 @@ BASE_KWARGS = {"incomplete_cutoff": {"keep_frac": 0.55}}
 VARIANTS = {
     "capital_france_clipped": ("capital_france", {"clip_end_s": 0.18}),
     "capital_france_noisy": ("capital_france", {"snr_db": 12}),
+    # A mid-thought cutoff that does NOT address the assistant (unlike
+    # incomplete_cutoff's "I wanted to ask you…") — listen mode must stay
+    # silent through it (tests/test_listen.py).
+    "filler_baking_cutoff": ("filler_baking", {"keep_frac": 0.55}),
     # am_adam holds a clear margin below smart-turn's 0.5 threshold after
     # the int16 WAV round-trip (0.25); am_michael sat at ~0.5 and flipped
     # with synthesis drift, breaking the held-turn tests.

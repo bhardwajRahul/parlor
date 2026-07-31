@@ -39,6 +39,9 @@ Browser (playback + transcript)
 - **Barge-in.** Interrupt the AI mid-sentence by speaking; generation is aborted server-side. Echo is handled without the browser's echo canceller (which muffles both the TTS voice and your barge-in on macOS): a sustained-speech gate plus a prompt rule — or just wear headphones.
 - **Background research delegation** (optional). Ask something that needs web search or real reasoning — "find the best pizza in Rome right now" — and the local model hands the task to a frontier model on any OpenAI-compatible endpoint (OpenRouter by default, with web search), keeps the conversation going, and speaks the answer when it comes back. Off unless `REASONER_API_KEY` is set; without it Parlor stays fully on-device.
 - **Live translation mode.** Say "translate everything I say into English" and Parlor becomes a consecutive interpreter: each utterance is rendered in English after a short silence window (no turn-completeness holds, no conversational replies), in any language Gemma understands. Say "stop translating" — or hit the stop chip — to return to conversation. One-way into English for now; the TTS voice is per-mode, so more Kokoro output languages are a config away.
+- **Just-listen mode.** Say "just listen for a while, I want to think out loud" and Parlor becomes a silent scribe: every utterance is transcribed on screen but nothing is spoken back — no replies, no holds — until you address it again ("okay, what do you think?") or hit the stop chip.
+- **Timers.** "Set a timer for three minutes for the pasta" — the model confirms and emits a control tag; the server owns the clock and, when it goes off, the model announces it out loud (waiting out anything currently playing, in any mode). A countdown chip with a cancel button tracks it in the transcript. Measured first (`benchmarks/timerprobe.py`): without this machinery the model promises timers 6/6 but announces them 1/6 even when told how much time passed — a turn-based model can't ring into silence, so the server must own the clock.
+- **A sense of elapsed time.** After a real gap, the next turn tells the model how much quiet preceded it ("about 2 minutes"), delegation deliveries say how long the research took, and the system prompt anchors when the session started — so "how long was I gone?" gets a real answer.
 
 ## Requirements
 
@@ -75,6 +78,7 @@ Models are downloaded automatically on first run (~5.7 GB for Gemma 4 E4B QAT + 
 | `PORT`             | `8000`                         | Server port                                    |
 | `TEMPERATURE`      | `0.7`                          | Sampling temperature (0 = deterministic)       |
 | `LLAMA_CTX`        | `16384`                        | llama.cpp context size. The server drops the oldest exchanges shortly before it fills |
+| `TIME_NOTE_MIN_S`  | `120`                          | Seconds of quiet before a turn carries an elapsed-time note |
 | `LLAMA_PORT`       | `8081`                         | Port for the spawned llama-server              |
 | `LLAMA_SERVER_URL` | (spawn our own)                | Use an already-running llama-server instead    |
 | `REASONER_API_KEY` | (unset — delegation off)       | API key for the background reasoner endpoint   |

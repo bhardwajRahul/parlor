@@ -16,6 +16,10 @@ Scored per syntax:
     uv run python benchmarks/tagbench.py --repeat 2 \
         --out benchmarks/results/tagbench-e4b.json
 
+--suite timer benches server.py's TIMER_INSTRUCTION verbatim instead:
+<timer> recall/misfire plus parse_ok (does server.parse_timer resolve the
+duration the model emitted, including spelled-out numbers).
+
 Runs its own llama-server on port 8099 (like turnbench), so a dev server
 on 8081 can keep running. Fixture WAVs cache in fixtures/tagbench/.
 """
@@ -58,6 +62,27 @@ PLAIN_CASES = {
     "what_is_rain": "Why does it rain more in the tropics?",
 }
 
+# Timer-tag cases (--suite timer, benched against server.TIMER_INSTRUCTION
+# verbatim): positives ask for a timer — including spelled-out durations,
+# which also exercise server.parse_timer — negatives mention durations
+# without asking for one.
+TIMER_CASES = {
+    "pasta_three": "Set a timer for three minutes for the pasta.",
+    "ten_minute": "Can you give me a ten minute timer?",
+    "remind_mom": "Remind me in five minutes to call my mom back.",
+    "twenty_sec": "Set a 20 second timer.",
+    "oven_fortyfive": "Set a timer for forty-five seconds to check the oven.",
+    "laundry_hour": "Please set a one hour timer for the laundry.",
+}
+TIMER_PLAIN_CASES = {
+    "ran_faster": "Last time I ran three minutes faster than my friend.",
+    "walk_station": "It usually takes about ten minutes to walk to the station.",
+    "movie_long": "That movie was almost three hours long.",
+    "microwave": "The timer on my old microwave is broken, it's so annoying.",
+    "capital_france": "What is the capital of France?",
+    "how_are_you": "Hey, how are you doing today?",
+}
+
 INSTRUCTION_COMMON = (
     "\n\nYou can hand a task to a powerful background research assistant "
     "that has web access. When the user asks for something that needs "
@@ -97,9 +122,8 @@ def production_prompts():
             server.DELEGATE_INSTRUCTION)
 
 
-def ensure_fixtures() -> dict[str, str]:
+def ensure_fixtures(cases: dict[str, str]) -> dict[str, str]:
     """name -> WAV base64, synthesizing any missing clips."""
-    cases = DELEGATE_CASES | PLAIN_CASES
     missing = [n for n in cases if not (CACHE_DIR / f"{n}.wav").exists()]
     if missing:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -147,16 +171,45 @@ def judge(raw: str, syntax: str, expects_tag: bool) -> dict:
     }
 
 
+def judge_timer(raw: str, expects_tag: bool) -> dict:
+    """Timer-suite judge: the production parser extracts the tag, and
+    parse_ok reports whether server.parse_timer can resolve its duration.
+    'timer' is legitimately SPOKEN in confirmations ("your three-minute
+    timer is set") — unlike the delegate suites, only markup counts as a
+    leak here."""
+    from parlor.server import parse_timer
+    p = StreamParser(expect_transcript=True, control_tags=("timer",))
+    spoken_parts = p.feed(raw)
+    tail, _ = p.finalize()
+    spoken = " ".join(spoken_parts + tail)
+    values = [v for n, v in p.tags if n == "TIMER"]
+    attempted = bool(re.search(r"<\s*/?\s*timer\b", raw, re.IGNORECASE))
+    return {
+        "expects_tag": expects_tag,
+        "well_formed": bool(values),
+        "attempted": attempted,
+        "malformed": attempted and not values,
+        "leaked": "<" in spoken or "##" in spoken,
+        "parse_ok": bool(values) and parse_timer(values[0])[0] is not None,
+        "task": values[0] if values else None,
+        "raw": raw,
+    }
+
+
 def score(results: list[dict]) -> dict:
     pos = [r for r in results if r["expects_tag"]]
     neg = [r for r in results if not r["expects_tag"]]
-    return {
+    out = {
         "recall": round(sum(r["well_formed"] for r in pos) / len(pos), 3) if pos else None,
         "misfire": round(sum(r["attempted"] for r in neg) / len(neg), 3) if neg else None,
         "malformed": sum(r["malformed"] for r in results),
         "leaked": sum(r["leaked"] for r in results),
         "n": len(results),
     }
+    if any("parse_ok" in r for r in results):
+        out["parse_ok"] = (round(sum(bool(r.get("parse_ok")) for r in pos)
+                                 / len(pos), 3) if pos else None)
+    return out
 
 
 def main() -> None:
@@ -168,17 +221,28 @@ def main() -> None:
                          "(the xml syntax it uses) instead of the symmetric "
                          "A/B instruction — the regression guard for prompt "
                          "changes")
+    ap.add_argument("--suite", choices=("delegate", "timer"), default="delegate",
+                    help="'timer' benches server.py's TIMER_INSTRUCTION "
+                         "verbatim: recall/misfire of <timer> plus parse_ok "
+                         "(does parse_timer resolve the emitted duration)")
     ap.add_argument("--out", default="")
     args = ap.parse_args()
 
     system, respond, delegate_instruction = production_prompts()
-    wavs = ensure_fixtures()
-    if args.production:
-        variants = [("production", system + delegate_instruction, "xml")]
+    if args.suite == "timer":
+        from parlor.server import TIMER_INSTRUCTION
+        positive_cases = TIMER_CASES
+        wavs = ensure_fixtures(TIMER_CASES | TIMER_PLAIN_CASES)
+        variants = [("timer-production", system + TIMER_INSTRUCTION, "timer")]
     else:
-        variants = [(s, system + INSTRUCTION_COMMON.format(
-                        example=SYNTAXES[s]["example"], name=SYNTAXES[s]["name"]), s)
-                    for s in args.syntaxes.split(",")]
+        positive_cases = DELEGATE_CASES
+        wavs = ensure_fixtures(DELEGATE_CASES | PLAIN_CASES)
+        if args.production:
+            variants = [("production", system + delegate_instruction, "xml")]
+        else:
+            variants = [(s, system + INSTRUCTION_COMMON.format(
+                            example=SYNTAXES[s]["example"], name=SYNTAXES[s]["name"]), s)
+                        for s in args.syntaxes.split(",")]
     llama.start()
     try:
         out = {"model": llama.MODEL, "temperature": llama.TEMPERATURE,
@@ -186,7 +250,7 @@ def main() -> None:
         for label, sys_prompt, syntax in variants:
             results = []
             for name, wav in wavs.items():
-                expects = name in DELEGATE_CASES
+                expects = name in positive_cases
                 for _ in range(args.repeat):
                     t0 = time.time()
                     raw = llama.chat_blocking(
@@ -194,11 +258,14 @@ def main() -> None:
                          {"role": "user", "content": [audio_part(wav),
                                                       text_part(respond)]}],
                         max_tokens=256)
-                    r = judge(raw, syntax, expects) | {"case": name}
+                    r = (judge_timer(raw, expects) if syntax == "timer"
+                         else judge(raw, syntax, expects)) | {"case": name}
                     results.append(r)
                     verdict = ("tag" if r["well_formed"] else
                                "MALFORMED" if r["malformed"] else "plain")
                     flag = " LEAKED" if r["leaked"] else ""
+                    if r["well_formed"] and r.get("parse_ok") is False:
+                        flag += " PARSE_FAIL"
                     ok = "✓" if (r["well_formed"] == expects and not r["malformed"]
                                  and not r["leaked"]) else "✗"
                     print(f"{ok} [{label}] {name}: {verdict}{flag} "

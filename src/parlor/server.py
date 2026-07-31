@@ -83,7 +83,9 @@ DELEGATE_INSTRUCTION = (
 # always-attended slot makes it emit the switch.
 MODE_SUFFIX = (
     " If the audio asks you to translate everything they say from now on, "
-    "confirm briefly and end with <mode>translate</mode>."
+    "confirm briefly and end with <mode>translate</mode>. If it asks you "
+    "to just listen quietly for a while and not respond, confirm briefly "
+    "and end with <mode>listen</mode>."
 )
 
 # The per-utterance instruction in translate mode. It carries the exit
@@ -103,6 +105,125 @@ TRANSLATE_PROMPT = (
     "<mode>conversation</mode>. If the audio has no clear words, write "
     "###TRANSCRIPT: (no speech) and nothing else."
 )
+
+# The per-utterance instruction in listen mode: a silent scribe. Like the
+# translate prompt it carries its own exit path — in this mode every
+# utterance is content to hear out, so the one exception (words addressed
+# TO the assistant to end the listening) must be spelled out where the
+# staying-quiet happens.
+LISTEN_PROMPT = (
+    "Quiet listening mode. The user asked you to just listen while they "
+    "talk or think out loud. Begin your reply with one line: "
+    "###TRANSCRIPT: followed by the exact words the user said in this "
+    "message's audio. Then write NOTHING else — no reply, no commentary, "
+    "no questions, even if they wonder about something or mention you: "
+    "they are still thinking. ONE exception: if their words clearly ask "
+    "YOU to start responding again — like \"okay, I'm done\", \"what do "
+    "you think?\", \"you can talk now\", \"stop listening\" — then "
+    "respond to them in 1-4 short sentences, spoken aloud, and end with "
+    "<mode>conversation</mode>. If the audio has no clear words, write "
+    "###TRANSCRIPT: (no speech) and nothing else."
+)
+
+# Modes whose audio turns replace the standard respond/flush instruction
+# wholesale (the mode chooses what a turn IS, not just how it's phrased).
+MODE_PROMPTS = {"translate": TRANSLATE_PROMPT, "listen": LISTEN_PROMPT}
+
+# Countdown timers. Always on (pure server machinery, no external
+# dependency) — the model confirms and emits the tag; the server owns the
+# clock and schedules the ring as a proactive turn. benchmarks/timerprobe.py
+# measured the alternative (the model announcing from elapsed-time notes
+# alone): promised 6/6, announced 1/6 — and a turn-based system can never
+# announce into silence. Recall/misfire of this exact instruction:
+# benchmarks/tagbench.py --suite timer.
+TIMER_INSTRUCTION = (
+    " You can set countdown timers. When the user asks for a timer, or to "
+    "be reminded in a given amount of time, say one short confirmation "
+    "sentence, then append <timer>the duration | a two-or-three-word "
+    "label</timer> — for example <timer>3 minutes | pasta</timer>; never "
+    "speak or mention that tag. The system will tell you when it goes "
+    "off, and you can tell the user then. If they give no duration, ask "
+    "for one instead of using the tag. Never use the tag for anything "
+    "else."
+)
+
+# The ring is a server-initiated turn like a delegation delivery: the
+# model phrases the announcement, and if it yields nothing speakable the
+# fallback IS the announcement. "System note (not user audio)" for the
+# same anti-echo reason as DELIVER_PROMPT.
+TIMER_PROMPT = (
+    'System note (not user audio): the user\'s countdown timer "{label}" '
+    "(set for {duration}) just went off. Tell them it's done in one short "
+    "spoken sentence. Don't start anything new."
+)
+TIMER_FALLBACK = "Ding — your {label} timer is done."
+
+# A session can only usefully run a few timers, and a runaway reply must
+# not schedule a ring per imagined tag; > 8h is a misparse, not a timer.
+MAX_PENDING_TIMERS = 3
+MAX_TIMER_S = 8 * 3600
+
+_WORD_NUMS = {
+    "a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
+    "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15,
+    "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19,
+    "twenty": 20, "thirty": 30, "forty": 40, "forty-five": 45, "fifty": 50,
+    "sixty": 60, "ninety": 90,
+}
+_UNIT_S = {"h": 3600, "m": 60, "s": 1}
+TIMER_VALUE_RE = re.compile(
+    r"(?P<num>\d+(?:\.\d+)?|[a-z]+(?:-[a-z]+)?)\s*"
+    r"(?P<unit>hours?|hrs?|minutes?|mins?|seconds?|secs?)\b",
+    re.IGNORECASE)
+
+
+def _duration_s(text: str) -> tuple[float, str] | None:
+    """(seconds, non-duration remainder) parsed from one tag segment, or
+    None. The duration may be digits or spelled out ('three minutes')."""
+    m = re.search(r"\bhalf an hour\b", text, re.IGNORECASE)
+    if m:
+        return 1800.0, (text[:m.start()] + text[m.end():]).strip()
+    for m in TIMER_VALUE_RE.finditer(text):
+        raw = m.group("num").lower()
+        try:
+            num = float(raw)
+        except ValueError:
+            num = _WORD_NUMS.get(raw, 0)
+        if num > 0:
+            rest = (text[:m.start()] + text[m.end():]).strip()
+            rest = re.sub(r"^(?:for|in)\b\s*(?:the\b\s*)?", "", rest,
+                          flags=re.IGNORECASE)
+            return num * _UNIT_S[m.group("unit")[0].lower()], rest
+    return None
+
+
+def parse_timer(value: str) -> tuple[float | None, str]:
+    """'3 minutes | pasta' → (180.0, 'pasta'). The duration may sit in
+    either |-segment or run inline ('10 minutes for the tea'); the label
+    is whatever the duration isn't. (None, '') when no resolvable
+    duration — the tag then never fires (and is stripped from history)."""
+    segments = [s.strip() for s in value.split("|")]
+    for i, seg in enumerate(segments):
+        parsed = _duration_s(seg)
+        if not parsed:
+            continue
+        seconds, rest = parsed
+        others = [s for j, s in enumerate(segments) if j != i and s]
+        label = " ".join(others) if others else rest
+        return seconds, re.sub(r"^\W+|\W+$", "", label)
+    return None, ""
+
+
+def duration_phrase(seconds: float) -> str:
+    """Exact spoken duration for timer prompts ('3 minutes', '90 seconds')
+    — unlike elapsed_phrase, a timer's length is not approximate."""
+    if seconds < 120:
+        return f"{seconds:g} seconds"
+    if seconds < 3600:
+        return f"{seconds / 60:g} minutes"
+    n = seconds / 3600
+    return "1 hour" if n == 1 else f"{n:g} hours"
 
 # A finished background task is delivered by the voice model, not read out
 # raw: it ties the answer back to the conversation and keeps one voice.
@@ -135,7 +256,7 @@ MAX_PENDING_DELEGATIONS = 3
 # prefix-cache prefix and survives mode switches, and a name the filter
 # doesn't know is spoken aloud, task text included. Modes gate ACTING on a
 # tag (spawn_delegations, apply_mode_tags), never parsing it.
-CONTROL_TAGS = ("delegate", "mode")
+CONTROL_TAGS = ("delegate", "mode", "timer")
 
 
 def strip_unfired_tags(text: str, tags: list) -> str:
@@ -309,7 +430,8 @@ async def websocket_endpoint(ws: WebSocket):
     delegation = reasoner.enabled()
     clock = time.strftime("%A at %I:%M %p").replace(" 0", " ")
     system = (SYSTEM_PROMPT + SESSION_CLOCK.format(clock=clock)
-              + (DELEGATE_INSTRUCTION if delegation else ""))
+              + (DELEGATE_INSTRUCTION if delegation else "")
+              + TIMER_INSTRUCTION)
     history: list = [{"role": "system", "content": system}]
     mode = MODES["conversation"]
 
@@ -362,7 +484,9 @@ async def websocket_endpoint(ws: WebSocket):
 
     delegation_ids = itertools.count(1)
     delegation_tasks: set[asyncio.Task] = set()
-    ready_delegations: list[dict] = []  # finished while the floor was busy
+    ready_events: list[dict] = []  # rang/finished while the floor was busy
+    timer_ids = itertools.count(1)
+    pending_timers: dict[int, dict] = {}  # id → {task, label, seconds}
     playing_since = {"t": 0.0}  # last spoken reply is (probably) still playing
     # When the line was last live — an exchange ending, or the user's
     # speech streaming in (so a long monologue doesn't read as a long
@@ -380,14 +504,24 @@ async def websocket_endpoint(ws: WebSocket):
         playing = playing_since["t"] and time.time() - playing_since["t"] < 30
         return bool(held_audio or speech_chunks or interrupted.is_set() or playing)
 
+    def deliverable(item: dict) -> bool:
+        """Timers ring in every mode — they are user-requested alarms.
+        Research results wait out translation/listening: an English answer
+        must not barge into an interpreting or quiet-listening session."""
+        return item["type"] == "timer_done" or mode.allows_delegation
+
     def drain_ready() -> None:
-        """Requeue one finished delegation whenever the floor frees up —
-        called at every point that releases it, because msg_queue only
-        wakes for client traffic and a result must not wait for one.
-        Results also wait out translation mode: an English research answer
-        must not barge into an interpreting session."""
-        if mode.allows_delegation and ready_delegations and not floor_busy():
-            msg_queue.put_nowait(ready_delegations.pop(0))
+        """Requeue one finished background event whenever the floor frees
+        up — called at every point that releases it, because msg_queue
+        only wakes for client traffic and a result must not wait for one.
+        Scans for the first deliverable item: a research answer parked by
+        translation must not block a timer ringing behind it."""
+        if floor_busy():
+            return
+        for i, item in enumerate(ready_events):
+            if deliverable(item):
+                msg_queue.put_nowait(ready_events.pop(i))
+                return
 
     async def switch_mode(name: str) -> bool:
         """Enter a mode by name (model tag or UI escape hatch). Unknown and
@@ -494,23 +628,82 @@ async def websocket_endpoint(ws: WebSocket):
         # the transcript parser consumes it and streams the real delivery;
         # with False the ##-markup cut would swallow the entire reply
         # (observed live).
-        raw_text, tags, pt, _ = await run_turn(ws, history + [user_msg], interrupted,
-                                               active, tts_backend,
-                                               expect_transcript=True,
-                                               control_tags=CONTROL_TAGS,
-                                               tts_voice=mode.tts_voice,
-                                               proactive=True,
-                                               fallback=done["answer"] if done["ok"]
-                                               else DELIVER_FALLBACK)
+        raw_text, tags, pt, _, spoke = await run_turn(
+            ws, history + [user_msg], interrupted, active, tts_backend,
+            expect_transcript=True,
+            control_tags=CONTROL_TAGS,
+            tts_voice=mode.tts_voice,
+            proactive=True,
+            fallback=done["answer"] if done["ok"] else DELIVER_FALLBACK)
         if pt:
             prompt_tokens["last"] = pt
-        if raw_text.strip():
+        if spoke:
             playing_since["t"] = time.time()  # this delivery is now playing
         unfired = await spawn_delegations(tags)  # a delivery may chain research
-        unfired += [(n, v) for n, v in tags if n == "MODE"]  # never applied here
+        # Mode switches and timers never fire from a delivery turn.
+        unfired += [(n, v) for n, v in tags if n in ("MODE", "TIMER")]
         remember(user_msg, strip_unfired_tags(raw_text, unfired), no_speech=False)
         last_activity["t"] = time.time()
         drain_ready()                  # more results may already be waiting
+
+    async def run_timer(timer_id: int, label: str, seconds: float) -> None:
+        """Sleep out the countdown, then re-enter the main loop through
+        msg_queue so the ring is serialized with real turns. Cancellation
+        during the sleep enqueues nothing."""
+        await asyncio.sleep(seconds)
+        await msg_queue.put({"type": "timer_done", "id": timer_id,
+                             "label": label, "seconds": seconds})
+
+    async def spawn_timers(tags: list[tuple[str, str]]) -> list:
+        """Returns the timer tags that did NOT fire (for history stripping
+        — the model must not believe a timer is running)."""
+        unfired = []
+        for name, value in tags:
+            if name != "TIMER":
+                continue
+            seconds, label = parse_timer(value)
+            if not seconds or seconds > MAX_TIMER_S:
+                print(f"Timer skipped (unparseable): {value!r}")
+                unfired.append((name, value))
+                continue
+            if len(pending_timers) >= MAX_PENDING_TIMERS:
+                print(f"Timer skipped (cap {MAX_PENDING_TIMERS}): {value!r}")
+                unfired.append((name, value))
+                continue
+            timer_id = next(timer_ids)
+            label = label or "timer"
+            print(f"Timer #{timer_id}: {seconds:.0f}s {label!r}")
+            t = asyncio.create_task(run_timer(timer_id, label, seconds))
+            pending_timers[timer_id] = {"task": t, "label": label,
+                                        "seconds": seconds}
+            await send_json(ws, {"type": "timer_started", "id": timer_id,
+                                 "label": label, "seconds": seconds})
+        return unfired
+
+    async def deliver_timer(done: dict) -> None:
+        """The ring: a server-initiated turn like a delegation delivery.
+        All tags on a ring turn are stripped — a ring must never switch
+        modes, chain research, or set another timer."""
+        entry = pending_timers.pop(done["id"], None)
+        if entry is None:
+            return  # cancelled after it fired
+        interrupted.clear()
+        await send_json(ws, {"type": "timer_resolved", "id": done["id"]})
+        prompt = TIMER_PROMPT.format(label=done["label"],
+                                     duration=duration_phrase(done["seconds"]))
+        user_msg = {"role": "user", "content": [text_part(prompt)]}
+        raw_text, tags, pt, _, spoke = await run_turn(
+            ws, history + [user_msg], interrupted, active, tts_backend,
+            expect_transcript=True, control_tags=CONTROL_TAGS,
+            tts_voice=mode.tts_voice, proactive=True,
+            fallback=TIMER_FALLBACK.format(label=done["label"]))
+        if pt:
+            prompt_tokens["last"] = pt
+        if spoke:
+            playing_since["t"] = time.time()
+        remember(user_msg, strip_unfired_tags(raw_text, tags), no_speech=False)
+        last_activity["t"] = time.time()
+        drain_ready()
 
     async def prime(audio_b64s: list[str]) -> None:
         """Warm the cache for the turn as it stands so far — reads the live
@@ -562,14 +755,15 @@ async def websocket_endpoint(ws: WebSocket):
 
             if msg.get("type") == "delegation_done":
                 if not mode.allows_delegation:
-                    # Parked until the user exits translation — tell the
-                    # client so its chip stops implying work in progress.
+                    # Parked until the user exits translation/listening —
+                    # tell the client so its chip stops implying work in
+                    # progress.
                     await send_json(ws, {"type": "delegation_parked",
                                          "id": msg["id"]})
-                    ready_delegations.append(msg)
+                    ready_events.append(msg)
                     continue
                 if floor_busy():
-                    ready_delegations.append(msg)  # deliver at the next idle moment
+                    ready_events.append(msg)  # deliver at the next idle moment
                     continue
                 try:
                     await deliver_delegation(msg)
@@ -579,8 +773,38 @@ async def websocket_endpoint(ws: WebSocket):
                     traceback.print_exc()  # keep the session alive
                     if not msg.get("redelivered"):
                         msg["redelivered"] = True  # one more try at idle
-                        ready_delegations.append(msg)
+                        ready_events.append(msg)
                     await release_client(ws)
+                continue
+
+            if msg.get("type") == "timer_done":
+                if msg["id"] not in pending_timers:
+                    continue  # cancelled after it fired
+                if floor_busy():
+                    ready_events.append(msg)  # ring at the next idle moment
+                    continue
+                try:
+                    await deliver_timer(msg)
+                except DISCONNECT_ERRORS:
+                    raise
+                except Exception:
+                    traceback.print_exc()  # keep the session alive
+                    pending_timers.pop(msg["id"], None)  # no re-ring
+                    await release_client(ws)
+                continue
+
+            if msg.get("type") == "cancel_timer":
+                # The chip's ✕ — like set_mode, a UI action that must work
+                # regardless of what the model believes.
+                entry = pending_timers.pop(msg.get("id"), None)
+                if entry:
+                    entry["task"].cancel()
+                    ready_events[:] = [e for e in ready_events
+                                       if not (e["type"] == "timer_done"
+                                               and e["id"] == msg["id"])]
+                    print(f"Timer #{msg['id']} cancelled")
+                    await send_json(ws, {"type": "timer_resolved",
+                                         "id": msg["id"], "cancelled": True})
                 continue
 
             if msg.get("type") == "frame":
@@ -655,29 +879,39 @@ async def websocket_endpoint(ws: WebSocket):
                 frame_image = None
                 held_audio = []
 
-                if mode.name == "translate" and has_audio:
-                    instruction = TRANSLATE_PROMPT
+                if mode.name in MODE_PROMPTS and has_audio:
+                    instruction = MODE_PROMPTS[mode.name]
                 else:
                     instruction = turn_instruction(msg, bool(image), has_audio)
                     if has_audio:
                         instruction += MODE_SUFFIX
-                        gap = time.time() - last_activity["t"]
-                        if gap >= TIME_NOTE_MIN_S:
-                            phrase = elapsed_phrase(gap)
-                            instruction += TIME_NOTE.format(phrase=phrase)
-                            print(f"Time note: {phrase}")
+                # The time note rides every audio turn except translation —
+                # an interpreter would render it. In listen mode it feeds
+                # the exit question ("how long was I at it?").
+                if has_audio and mode.name != "translate":
+                    gap = time.time() - last_activity["t"]
+                    if gap >= TIME_NOTE_MIN_S:
+                        phrase = elapsed_phrase(gap)
+                        instruction += TIME_NOTE.format(phrase=phrase)
+                        print(f"Time note: {phrase}")
+                # A listen-mode utterance is MEANT to end silent — no
+                # fallback line; every other audio turn must never do so.
+                if mode.name == "listen" and has_audio:
+                    fallback = None
+                else:
+                    fallback = (FLUSH_FALLBACK if is_flush
+                                else AUDIO_FALLBACK if has_audio else None)
                 user_msg = {"role": "user", "content": content + [text_part(instruction)]}
-                raw_text, tags, pt, no_speech = await run_turn(
+                raw_text, tags, pt, no_speech, spoke = await run_turn(
                     ws, history + [user_msg], interrupted, active,
                     tts_backend, expect_transcript=has_audio,
                     p_complete=p_complete,
                     control_tags=CONTROL_TAGS,
                     tts_voice=mode.tts_voice,
-                    fallback=FLUSH_FALLBACK if is_flush
-                    else AUDIO_FALLBACK if has_audio else None)
+                    fallback=fallback)
                 if pt:
                     prompt_tokens["last"] = pt
-                if raw_text.strip():
+                if spoke:
                     playing_since["t"] = time.time()  # reply now playing client-side
                 if no_speech:
                     # No user words stand behind this turn: a control tag
@@ -687,6 +921,7 @@ async def websocket_endpoint(ws: WebSocket):
                     unfired = tags
                 else:
                     unfired = await spawn_delegations(tags)
+                    unfired += await spawn_timers(tags)
                     unfired += await apply_mode_tags(tags)
                 remember(user_msg, strip_unfired_tags(raw_text, unfired), no_speech)
                 last_activity["t"] = time.time()
@@ -704,6 +939,8 @@ async def websocket_endpoint(ws: WebSocket):
         recv_task.cancel()
         for t in delegation_tasks:
             t.cancel()
+        for entry in pending_timers.values():
+            entry["task"].cancel()
 
 
 def main() -> None:

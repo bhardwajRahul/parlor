@@ -366,6 +366,34 @@
   .delegation-chip.parked .loading-dots { display: none; }
   .delegation-chip.parked { color: var(--c-listen); background: var(--c-listen-dim); }
 
+  /* A running countdown timer */
+  .timer-chip {
+    align-self: flex-start;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 14px;
+    border-radius: 100px;
+    background: var(--c-listen-dim);
+    color: var(--c-listen);
+    font-size: 12px;
+    animation: msg-in 0.25s ease-out;
+  }
+
+  .timer-chip .countdown { font-variant-numeric: tabular-nums; font-weight: 600; }
+
+  .timer-cancel {
+    border: none;
+    background: none;
+    color: inherit;
+    opacity: 0.6;
+    cursor: pointer;
+    font-size: 11px;
+    padding: 0 2px;
+  }
+
+  .timer-cancel:hover { opacity: 1; }
+
   .loading-dots {
     display: inline-flex;
     gap: 4px;

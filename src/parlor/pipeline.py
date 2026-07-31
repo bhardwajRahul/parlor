@@ -387,7 +387,7 @@ async def run_turn(ws, messages: list, interrupted: asyncio.Event,
                    tts_voice: str = "af_heart",
                    proactive: bool = False,
                    fallback: str | None = None
-                   ) -> tuple[str, list, int | None, bool]:
+                   ) -> tuple[str, list, int | None, bool, bool]:
     """Stream one model turn: decode → sentences → TTS, all pipelined. The
     transcript line is pushed to the client the moment it completes, while
     the response is still decoding. Returns the raw generated text, any
@@ -399,7 +399,9 @@ async def run_turn(ws, messages: list, interrupted: asyncio.Event,
     user words stand behind this turn, so the caller must not store it or
     act on its tags. A turn that merely OMITS the transcript marker is
     not no_speech: real words were heard and answered, only the format
-    slipped.
+    slipped. The final element is spoke: whether any TTS audio was sent —
+    the caller's floor bookkeeping must key on it, not on the text (a
+    transcript-only turn has text but plays nothing).
 
     proactive marks a server-initiated turn (delegation delivery): the
     model's transcript line is its own echo, not the user's words, so no
@@ -491,6 +493,16 @@ async def run_turn(ws, messages: list, interrupted: asyncio.Event,
             if not proactive and echoes_instruction(sentence, instruction, n=6):
                 print(f"Sentence suppressed (instruction echo): {sentence!r}")
                 continue
+            # The model sometimes ANNOTATES instead of speaking — a reply
+            # of literally '(no speech)' (observed at temp 0 in listen
+            # mode, imitating the transcript clause). An annotation is a
+            # report that there is nothing to say; NO_SPEECH_RE already
+            # pins the shape, and no genuine reply is one bracketed
+            # aside. Suppressing it lets a turn end silent instead of
+            # speaking markup.
+            if NO_SPEECH_RE.match(sentence):
+                print(f"Sentence suppressed (annotation): {sentence!r}")
+                continue
             if tts_started_at is None:
                 tts_started_at = time.time()
             await send_json(ws, {"type": "text_delta", "text": sentence + " "})
@@ -561,7 +573,8 @@ async def run_turn(ws, messages: list, interrupted: asyncio.Event,
         # An aborted turn fires nothing, so its stored text must not carry
         # a tag either — the model must not believe it already delegated.
         text = parser._filter.strip(raw["text"]) if parser._filter else raw["text"]
-        return text, [], stream.prompt_tokens, turn_no_speech()
+        return (text, [], stream.prompt_tokens, turn_no_speech(),
+                audio_state["started"])
 
     await send_json(ws, {
         "type": "turn_final",
@@ -574,7 +587,8 @@ async def run_turn(ws, messages: list, interrupted: asyncio.Event,
     if audio_state["started"]:
         await send_json(ws, {"type": "audio_end",
                              "tts_time": timings.get("tts_time", 0)})
-    return raw["text"], parser.tags, stream.prompt_tokens, turn_no_speech()
+    return (raw["text"], parser.tags, stream.prompt_tokens, turn_no_speech(),
+            audio_state["started"])
 
 
 async def prime_cache(messages: list) -> None:
