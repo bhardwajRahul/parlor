@@ -364,21 +364,18 @@ function removeTimerChip(id) {
   const chip = timerChips.get(id);
   timerChips.delete(id);
   if (chip) chip.el.remove();
-  if (!timerChips.size && timerTicker) {
-    clearInterval(timerTicker);
-    timerTicker = null;
-  }
 }
 
 function clearTimerChips() {
   timerChips.forEach(({ el }) => el.remove());
   timerChips.clear();
-  if (timerTicker) { clearInterval(timerTicker); timerTicker = null; }
 }
 
 function tickTimers() {
-  // Clamped at 0:00 — a ring parked behind a busy floor shows a finished
-  // countdown until the spoken announcement lands.
+  // The ticker stops itself once the last chip is gone, so removing one is
+  // just a map delete. Countdowns clamp at 0:00 — a ring parked behind a
+  // busy floor shows a finished countdown until the announcement lands.
+  if (!timerChips.size) { clearInterval(timerTicker); timerTicker = null; return; }
   timerChips.forEach(({ el, deadline }) => {
     const left = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
     el.querySelector('.countdown').textContent =

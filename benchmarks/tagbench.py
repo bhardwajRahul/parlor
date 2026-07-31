@@ -119,7 +119,7 @@ SYNTAXES = {
 def production_prompts():
     from parlor import server
     return (server.SYSTEM_PROMPT, server.RESPOND_PROMPT.format(camera=""),
-            server.DELEGATE_INSTRUCTION)
+            server.DELEGATE_INSTRUCTION, server.TIMER_INSTRUCTION)
 
 
 def ensure_fixtures(cases: dict[str, str]) -> dict[str, str]:
@@ -137,15 +137,21 @@ def ensure_fixtures(cases: dict[str, str]) -> dict[str, str]:
             for n in cases}
 
 
+def parse_production(raw: str, tag: str) -> tuple[str, list]:
+    """One reply through the real production parser: (what TTS would say,
+    the control tags it extracted)."""
+    p = StreamParser(expect_transcript=True, control_tags=(tag,))
+    spoken = p.feed(raw)
+    tail, _ = p.finalize()
+    return " ".join(spoken + tail), p.tags
+
+
 def spoken_text(raw: str, syntax: str) -> str:
     """What TTS would say: the XML path uses the real production parser
     (which extracts <delegate> elements); the hash path simulates a
     ###DELEGATE:-line parser by regex."""
     if syntax == "xml":
-        p = StreamParser(expect_transcript=True, control_tags=("delegate",))
-        spoken = p.feed(raw)
-        tail, _ = p.finalize()
-        return " ".join(spoken + tail)
+        return parse_production(raw, "delegate")[0]
     text = SYNTAXES["hash"]["strict"].sub("", raw)
     m = re.search(r"#{2,}[ \t]*TRANSCRIPT[ \t]*:[^\n]*\n?", text, re.IGNORECASE)
     if m:
@@ -178,11 +184,8 @@ def judge_timer(raw: str, expects_tag: bool) -> dict:
     timer is set") — unlike the delegate suites, only markup counts as a
     leak here."""
     from parlor.server import parse_timer
-    p = StreamParser(expect_transcript=True, control_tags=("timer",))
-    spoken_parts = p.feed(raw)
-    tail, _ = p.finalize()
-    spoken = " ".join(spoken_parts + tail)
-    values = [v for n, v in p.tags if n == "TIMER"]
+    spoken, tags = parse_production(raw, "timer")
+    values = [v for n, v in tags if n == "TIMER"]
     attempted = bool(re.search(r"<\s*/?\s*timer\b", raw, re.IGNORECASE))
     return {
         "expects_tag": expects_tag,
@@ -228,12 +231,11 @@ def main() -> None:
     ap.add_argument("--out", default="")
     args = ap.parse_args()
 
-    system, respond, delegate_instruction = production_prompts()
+    system, respond, delegate_instruction, timer_instruction = production_prompts()
     if args.suite == "timer":
-        from parlor.server import TIMER_INSTRUCTION
         positive_cases = TIMER_CASES
         wavs = ensure_fixtures(TIMER_CASES | TIMER_PLAIN_CASES)
-        variants = [("timer-production", system + TIMER_INSTRUCTION, "timer")]
+        variants = [("timer-production", system + timer_instruction, "timer")]
     else:
         positive_cases = DELEGATE_CASES
         wavs = ensure_fixtures(DELEGATE_CASES | PLAIN_CASES)
