@@ -137,14 +137,17 @@ MODE_PROMPTS = {"translate": TRANSLATE_PROMPT, "listen": LISTEN_PROMPT}
 # announce into silence. Recall/misfire of this exact instruction:
 # benchmarks/tagbench.py --suite timer.
 TIMER_INSTRUCTION = (
-    " You can set countdown timers. When the user asks for a timer, or to "
-    "be reminded in a given amount of time, say one short confirmation "
-    "sentence, then append <timer>the duration | a two-or-three-word "
-    "label</timer> — for example <timer>3 minutes | pasta</timer>; never "
-    "speak or mention that tag. The system will tell you when it goes "
-    "off, and you can tell the user then. If they give no duration, ask "
-    "for one instead of using the tag. Never use the tag for anything "
-    "else."
+    " You can also set countdown timers — but ONLY the timer tag actually "
+    "sets one; a spoken promise alone sets nothing and the user would "
+    "wait forever. When the user asks for a timer, or to be reminded "
+    "after some amount of time, you MUST end your reply with the tag. "
+    "Say one short confirmation sentence, then append "
+    "<timer>the duration | a two-or-three-word label</timer>. Example "
+    "reply: Three minutes — I'll let you know. "
+    "<timer>3 minutes | pasta</timer> — never speak or mention the tag "
+    "itself. The system tells you when it goes off, and you announce it "
+    "to the user then. If they give no duration, ask for one instead. "
+    "Never use the tag for anything else."
 )
 
 # The ring is a server-initiated turn like a delegation delivery: the
