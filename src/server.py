@@ -94,7 +94,7 @@ MODE_SUFFIX = (
 # session) must be spelled out where the translating happens.
 TRANSLATE_PROMPT = (
     "Live translation mode. Begin your reply with one line: ###TRANSCRIPT: "
-    "followed by the exact words the user said in their audio message, in "
+    "followed by the exact words the user said in this message's audio, in "
     "their original language. Then, on a new line, write ONLY the English "
     "translation of those words — no commentary, no answers, no opinions. "
     "If they already spoke English, restate their words in clear English. "
@@ -102,7 +102,8 @@ TRANSLATE_PROMPT = (
     "translation — like \"stop translating\", \"go back to normal "
     "conversation\", \"berhenti menerjemahkan\", \"deja de traducir\" — do "
     "NOT translate it: confirm in one short sentence and end with "
-    "<mode>conversation</mode>."
+    "<mode>conversation</mode>. If the audio has no clear words, write "
+    "###TRANSCRIPT: (no speech) and nothing else."
 )
 
 # A finished background task is delivered by the voice model, not read out
@@ -158,9 +159,25 @@ def strip_unfired_tags(text: str, tags: list) -> str:
 # long utterances) before first audio — measured worth it. Grammar-forced
 # JSON ({transcript, response}) was also measured: format breaks 1-3/3 on
 # degraded audio and 3/3 on chunked — don't go back to structured output.
+# The no-speech clause gives the model a sanctioned out for VAD false
+# triggers (breath, cough, room noise). Without it the prompt DEMANDS
+# words, so on speechless audio the model invents some — measured at
+# temp 0.7: a breath came back as "Hi, can you help me with my homework?"
+# (answered), "can you translate everything I say from now on?" (mode
+# switched!), or an earlier turn's question copied verbatim. "this
+# message's audio" (not "their audio message") points the transcription
+# at the newest clip among the many in history; measured clean with this
+# wording at temp 0 and 0.7 (WER 0.0 on speech, fresh and late).
+NO_SPEECH_CLAUSE = (
+    " If the audio has no clear words — noise, breathing, silence — write "
+    "###TRANSCRIPT: (no speech) instead; never guess words or repeat "
+    "earlier ones."
+)
+
 RESPOND_PROMPT = (
     "Begin your reply with one line: ###TRANSCRIPT: followed by the exact "
-    "words the user said in their audio message. Then, on a new line, respond "
+    "words the user said in this message's audio." + NO_SPEECH_CLAUSE +
+    " Then, on a new line, respond "
     "to them: 1-4 short sentences, spoken aloud.{camera}"
 )
 
@@ -178,7 +195,8 @@ AUDIO_FALLBACK = "Sorry, I didn't catch that — could you say it again?"
 # stop, leaving the turn silent.
 FLUSH_PROMPT = (
     "Begin your reply with one line: ###TRANSCRIPT: followed by the exact "
-    "words the user said in their audio message. The user paused mid-thought, "
+    "words the user said in this message's audio." + NO_SPEECH_CLAUSE +
+    " The user paused mid-thought, "
     "so on a new line: if their words feel unfinished, write one short, warm "
     "sentence encouraging them to continue; otherwise respond to them in 1-4 "
     "short sentences, spoken aloud.{camera}"
@@ -186,7 +204,26 @@ FLUSH_PROMPT = (
 
 # Rotate history before the llama context fills. Rough token estimates are
 # fine here — the guard just needs to fire before generation degrades.
-CONTEXT_HEADROOM = 2000
+# Scaled to the context size: a fixed 2000 against the suite's small
+# LLAMA_CTX left a near-zero threshold, rotating on every turn — history
+# never accumulated, so the e2e suite silently stopped exercising
+# multi-turn context at all.
+CONTEXT_HEADROOM = max(512, min(2000, llama.CTX // 8))
+
+
+def rotate_history(history: list) -> list:
+    """Drop the oldest quarter of messages, keeping the system prompt. The
+    kept slice must start on a user message: dropping a user turn while
+    keeping its reply would leave an orphaned assistant message about
+    words that no longer exist. A history with at most one exchange
+    returns unchanged (nothing droppable — and slicing a bare [system]
+    would duplicate the system prompt)."""
+    if len(history) <= 3:
+        return history
+    keep = 1 + max(2, 3 * (len(history) - 1) // 4)
+    while keep > 3 and history[-(keep - 1)].get("role") != "user":
+        keep -= 1
+    return [history[0]] + history[-(keep - 1):]
 
 tts_backend = None
 detector = None  # smart-turn end-of-turn classifier
@@ -270,13 +307,23 @@ async def websocket_endpoint(ws: WebSocket):
     speech_chunks: list[str] = []    # streamed-in speech, already cache-primed
     held_audio: list[str] = []       # incomplete-turn segments awaiting continuation
 
-    def remember(user_msg: dict, raw_text: str) -> None:
-        """Store a finished turn verbatim (same bytes → full prefix-cache hit
-        on the next request). A turn the model produced nothing for is never
-        stored — a degenerate message poisons all later requests."""
-        if raw_text.strip():
-            history.append(user_msg)
-            history.append({"role": "assistant", "content": raw_text})
+    def remember(user_msg: dict, raw_text: str, no_speech: bool) -> None:
+        """Store a finished turn verbatim (same bytes → full prefix-cache
+        hit on the next request). Two kinds of turn are never stored,
+        because a degenerate message poisons every later request: one the
+        model produced nothing for, and a no_speech turn (the transcript
+        line was a no-speech annotation or an instruction echo — no user
+        words stand behind it; one stored echo loop came back as invented
+        or copied user words on every turn after it). Voice turns must
+        keep their raw audio: an experiment storing the transcript as
+        user text instead made the model copy the PREVIOUS turn's text as
+        the new turn's transcript, deterministically at temp 0 —
+        user-role text reads as 'what the user said' more strongly than
+        the current audio does."""
+        if not raw_text.strip() or no_speech:
+            return
+        history.append(user_msg)
+        history.append({"role": "assistant", "content": raw_text})
 
     delegation_ids = itertools.count(1)
     delegation_tasks: set[asyncio.Task] = set()
@@ -400,26 +447,26 @@ async def websocket_endpoint(ws: WebSocket):
         prompt = (DELIVER_PROMPT if done["ok"] else DELIVER_FAILED_PROMPT).format(
             task=done["task"], answer=done["answer"])
         user_msg = {"role": "user", "content": [text_part(prompt)]}
-        # expect_transcript=True although there is no audio: history trains
-        # the model to open every reply with ###TRANSCRIPT:, and it often
-        # does so here too (echoing the instruction). The transcript parser
-        # consumes that line and streams the real delivery; with False the
-        # ##-markup cut would swallow the entire reply (observed live).
-        raw_text, tags, pt = await run_turn(ws, history + [user_msg], interrupted,
-                                            active, tts_backend,
-                                            expect_transcript=True,
-                                            control_tags=CONTROL_TAGS,
-                                            tts_voice=mode.tts_voice,
-                                            proactive=True,
-                                            fallback=done["answer"] if done["ok"]
-                                            else DELIVER_FALLBACK)
+        # expect_transcript=True although there is no audio: the model
+        # often opens a delivery with an imitated ###TRANSCRIPT: line, and
+        # the transcript parser consumes it and streams the real delivery;
+        # with False the ##-markup cut would swallow the entire reply
+        # (observed live).
+        raw_text, tags, pt, _ = await run_turn(ws, history + [user_msg], interrupted,
+                                               active, tts_backend,
+                                               expect_transcript=True,
+                                               control_tags=CONTROL_TAGS,
+                                               tts_voice=mode.tts_voice,
+                                               proactive=True,
+                                               fallback=done["answer"] if done["ok"]
+                                               else DELIVER_FALLBACK)
         if pt:
             prompt_tokens["last"] = pt
         if raw_text.strip():
             playing_since["t"] = time.time()  # this delivery is now playing
         unfired = await spawn_delegations(tags)  # a delivery may chain research
         unfired += [(n, v) for n, v in tags if n == "MODE"]  # never applied here
-        remember(user_msg, strip_unfired_tags(raw_text, unfired))
+        remember(user_msg, strip_unfired_tags(raw_text, unfired), no_speech=False)
         drain_ready()                  # more results may already be waiting
 
     async def prime(audio_b64s: list[str]) -> None:
@@ -444,11 +491,12 @@ async def websocket_endpoint(ws: WebSocket):
             est = estimate_tokens(history)
             used = max(est, prompt_tokens["last"])
             if used > llama.CTX - 2 * CONTEXT_HEADROOM:
-                keep = 1 + max(2, 3 * (len(history) - 1) // 4)
-                print(f"Context near limit (est {est}, real {prompt_tokens['last']}) "
-                      f"— dropping {len(history) - keep} oldest messages")
-                history = [history[0]] + history[-(keep - 1):]
-                prompt_tokens["last"] = 0  # stale after a rotation
+                rotated = rotate_history(history)
+                if len(rotated) < len(history):
+                    print(f"Context near limit (est {est}, real {prompt_tokens['last']}) "
+                          f"— dropping {len(history) - len(rotated)} oldest messages")
+                    history = rotated
+                    prompt_tokens["last"] = 0  # stale after a rotation
 
             if msg.get("type") == "ready":
                 # The client returned to idle listening: playback finished,
@@ -569,20 +617,28 @@ async def websocket_endpoint(ws: WebSocket):
                     if has_audio:
                         instruction += MODE_SUFFIX
                 user_msg = {"role": "user", "content": content + [text_part(instruction)]}
-                raw_text, tags, pt = await run_turn(ws, history + [user_msg], interrupted, active,
-                                                    tts_backend, expect_transcript=has_audio,
-                                                    p_complete=p_complete,
-                                                    control_tags=CONTROL_TAGS,
-                                                    tts_voice=mode.tts_voice,
-                                                    fallback=FLUSH_FALLBACK if is_flush
-                                                    else AUDIO_FALLBACK if has_audio else None)
+                raw_text, tags, pt, no_speech = await run_turn(
+                    ws, history + [user_msg], interrupted, active,
+                    tts_backend, expect_transcript=has_audio,
+                    p_complete=p_complete,
+                    control_tags=CONTROL_TAGS,
+                    tts_voice=mode.tts_voice,
+                    fallback=FLUSH_FALLBACK if is_flush
+                    else AUDIO_FALLBACK if has_audio else None)
                 if pt:
                     prompt_tokens["last"] = pt
                 if raw_text.strip():
                     playing_since["t"] = time.time()  # reply now playing client-side
-                unfired = await spawn_delegations(tags)
-                unfired += await apply_mode_tags(tags)
-                remember(user_msg, strip_unfired_tags(raw_text, unfired))
+                if no_speech:
+                    # No user words stand behind this turn: a control tag
+                    # born from noise must not act (measured live — a breath
+                    # transcribed as "translate everything I say" switched
+                    # the session into translate mode).
+                    unfired = tags
+                else:
+                    unfired = await spawn_delegations(tags)
+                    unfired += await apply_mode_tags(tags)
+                remember(user_msg, strip_unfired_tags(raw_text, unfired), no_speech)
             except DISCONNECT_ERRORS:
                 raise
             except Exception:

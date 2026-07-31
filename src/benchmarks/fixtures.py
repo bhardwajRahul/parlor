@@ -63,6 +63,35 @@ FIXTURES = {
         "Can you remind me what my name is?",
         ["name"],
     ),
+    # Transcript-stability fillers (tests/test_transcription_stability.py):
+    # each carries content words unique across the whole fixture set, so a
+    # transcript that borrows another turn's words is provably written from
+    # history, not from the audio. Plain statements on purpose — no
+    # search/current-info phrasing that would fire <delegate>.
+    "filler_color": (
+        "My favorite color is turquoise, like the sea near my childhood home.",
+        ["turquoise"],
+    ),
+    "filler_pet": (
+        "I adopted a golden retriever puppy last month and named him Biscuit.",
+        ["biscuit"],
+    ),
+    "filler_baking": (
+        "On weekends I like to bake sourdough bread with rosemary and olives.",
+        ["sourdough"],
+    ),
+    "filler_novel": (
+        "I have been reading a mystery novel set in Lisbon about a missing violin.",
+        ["lisbon"],
+    ),
+    "filler_jazz": (
+        "Lately I have been listening to a lot of jazz piano records in the evening.",
+        ["jazz"],
+    ),
+    "filler_garden": (
+        "This spring I want to plant tomatoes and basil on my balcony.",
+        ["basil"],
+    ),
     # Delegation e2e: explicit "search the web" phrasing so the model
     # reliably emits the <delegate> tag (see benchmarks/tagbench.py).
     "delegate_pizza": (
@@ -184,6 +213,26 @@ def generate_all(force: bool = False) -> None:
         pcm = _synthesize(backend, text, **kwargs)
         _write_wav(FIXTURES_DIR / f"{name}.wav", pcm, TARGET_SR)
         print(f"fixture {name}: {len(pcm) / TARGET_SR:.1f}s speech")
+
+
+def breath_wav_b64(seconds: float = 1.2, level: float = 0.03, seed: int = 7) -> str:
+    """Non-speech audio like a VAD false trigger captures: low-pass noise
+    with a breath-like swell (level scales the pre-envelope RMS). Long
+    enough to pass the server's valid_audio check, seeded so every run
+    sends identical bytes."""
+    n = int(seconds * TARGET_SR)
+    rng = np.random.default_rng(seed)
+    noise = np.convolve(rng.standard_normal(n).astype(np.float32),
+                        np.ones(48, dtype=np.float32) / 48, mode="same")
+    env = np.sin(np.linspace(0, np.pi, n)).astype(np.float32) ** 2
+    pcm = noise / (np.sqrt(np.mean(noise**2)) + 1e-9) * level * env
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(TARGET_SR)
+        w.writeframes((pcm * 32767).clip(-32768, 32767).astype(np.int16).tobytes())
+    return base64.b64encode(buf.getvalue()).decode()
 
 
 def load_wav_b64(name: str) -> str:

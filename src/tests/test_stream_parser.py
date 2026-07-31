@@ -336,3 +336,36 @@ def test_parser_without_control_tags_is_unchanged():
     spoken, _, _ = run(["###TRANSCRIPT: hi\n", "Hello. ",
                         "<delegate>x</delegate> ## notes"])
     assert spoken == ["Hello.", "<delegate>x</delegate>"]
+
+
+def test_no_speech_annotations_are_not_user_words():
+    # A transcript that is entirely a bracketed annotation reports that
+    # there were no words — shown/stored as user speech it becomes a
+    # hallucination ('[Silence]' appeared as a user bubble, live).
+    from pipeline import NO_SPEECH_RE
+    for t in ["(no speech)", "(No Speech)", "no speech", "No speech.",
+              "(noise)", "[Silence]", "*sigh*", "(background noise)",
+              "(static hum)", "[inaudible]"]:
+        assert NO_SPEECH_RE.match(t), t
+    # Real utterances — including ones that merely start with or contain
+    # such words — must pass through untouched.
+    for t in ["Silence is golden, don't you think?",
+              "What is the capital of France?",
+              "I heard a noise in the garden (I think).",
+              "(", "(a very long parenthesized ramble that goes on and on "
+              "far past any plausible annotation length, word after word)"]:
+        assert not NO_SPEECH_RE.match(t), t
+
+
+def test_quoted_prompt_phrases_are_not_echoes():
+    # The translate prompt QUOTES the exit phrases users actually say — a
+    # genuine "go back to normal conversation" must not read as an
+    # instruction echo (pre-fix it did, and the no-transcript tag gate
+    # then dropped the <mode>conversation</mode> exit).
+    import server
+    said = "Okay, stop translating now and go back to normal conversation."
+    assert not echoes_instruction(said, server.TRANSLATE_PROMPT)
+    # Unquoted instruction prose still reads as an echo.
+    assert echoes_instruction(
+        "If the audio has no clear words write no speech instead",
+        server.TRANSLATE_PROMPT)

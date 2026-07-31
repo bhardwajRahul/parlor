@@ -339,6 +339,18 @@ def _norm_words(text: str) -> list[str]:
     return re.sub(r"[^a-z0-9' ]+", " ", text.lower()).split()
 
 
+# A transcript that is entirely a bracketed annotation — the sanctioned
+# "(no speech)" from the turn prompts, or free-form variants the model
+# produces on its own ("(noise)", "[Silence]", "*sigh*", "(background
+# noise)") — reports that there were no words. It must never be shown or
+# stored as user words. Real transcripts are plain words, never fully
+# bracketed; the length cap keeps a genuine parenthesized ramble out.
+NO_SPEECH_RE = re.compile(
+    r"^(?:\(\s*[^)]{1,40}\)|\[\s*[^\]]{1,40}\]|\*\s*[^*]{1,40}\*"
+    r"|no speech)[.!\s]*$",
+    re.IGNORECASE)
+
+
 def echoes_instruction(transcript: str, instruction: str, n: int = 5) -> bool:
     """True when the model's transcript line is an echo of the turn's own
     instruction text rather than the user's words — e.g. a flush turn's
@@ -346,10 +358,15 @@ def echoes_instruction(transcript: str, instruction: str, n: int = 5) -> bool:
     which the client would display as something the user said. Any run of
     n consecutive transcript words appearing verbatim in the instruction
     is an echo; genuine speech doesn't reproduce 5-word runs of prompt
-    text, and shorter overlaps ('what you see') are common English."""
+    text, and shorter overlaps ('what you see') are common English.
+    Double-quoted spans are stripped from the instruction first: a prompt
+    quotes phrases the user is EXPECTED to say (the translate prompt's
+    exit examples like "go back to normal conversation"), and a genuine
+    utterance reproducing one must not read as an echo."""
     words = _norm_words(transcript)
     if len(words) < n:
         return False
+    instruction = re.sub(r'"[^"]*"', " ", instruction)
     haystack = " " + " ".join(_norm_words(instruction)) + " "
     return any(" " + " ".join(words[i:i + n]) + " " in haystack
                for i in range(len(words) - n + 1))
@@ -369,14 +386,20 @@ async def run_turn(ws, messages: list, interrupted: asyncio.Event,
                    control_tags: tuple[str, ...] = (),
                    tts_voice: str = "af_heart",
                    proactive: bool = False,
-                   fallback: str | None = None) -> tuple[str, list, int | None]:
+                   fallback: str | None = None
+                   ) -> tuple[str, list, int | None, bool]:
     """Stream one model turn: decode → sentences → TTS, all pipelined. The
     transcript line is pushed to the client the moment it completes, while
-    the response is still decoding. Returns the raw generated text (stored
-    verbatim in history so the next request gets a full prefix-cache hit),
-    any control tags the model emitted — empty if interrupted, so an
-    aborted turn never fires an action — and the request's real prompt
-    token count when llama-server reported one (drives history rotation).
+    the response is still decoding. Returns the raw generated text, any
+    control tags the model emitted — empty if interrupted, so an aborted
+    turn never fires an action — the request's real prompt token count
+    when llama-server reported one (drives history rotation), and
+    no_speech: True when the model wrote a transcript line that had to be
+    rejected (a no-speech annotation, or an echo of the instruction) — no
+    user words stand behind this turn, so the caller must not store it or
+    act on its tags. A turn that merely OMITS the transcript marker is
+    not no_speech: real words were heard and answered, only the format
+    slipped.
 
     proactive marks a server-initiated turn (delegation delivery): the
     model's transcript line is its own echo, not the user's words, so no
@@ -438,8 +461,15 @@ async def run_turn(ws, messages: list, interrupted: asyncio.Event,
 
     def clean_transcript(text: str | None) -> str | None:
         """The client shows this as the user's words — never instruction
-        text the model echoed (a live flush-turn bug on real mics)."""
-        if text and echoes_instruction(text, instruction):
+        text the model echoed (a live flush-turn bug on real mics), and
+        never a non-speech annotation ('(no speech)', '[Silence]'): that
+        is the model reporting there were no words to transcribe."""
+        if not text:
+            return None
+        if NO_SPEECH_RE.match(text):
+            print(f"Transcript is a no-speech report: {text!r}")
+            return None
+        if echoes_instruction(text, instruction):
             print(f"Transcript suppressed (instruction echo): {text!r}")
             return None
         return text
@@ -447,6 +477,20 @@ async def run_turn(ws, messages: list, interrupted: asyncio.Event,
     async def dispatch(sentences: list[str]):
         nonlocal tts_started_at
         for sentence in sentences:
+            # A sentence that reproduces a run of the turn's own instruction
+            # is the model echoing its prompt, not speech — observed live as
+            # 'CRIPT: Begin your reply with one line:' read aloud after a
+            # degenerate transcript loop was cut mid-tag. Never on proactive
+            # turns (the delivery prompt embeds the answer being relayed),
+            # and at n=6 so short quoted phrases the user may legitimately
+            # trigger ('go back to normal conversation') still speak.
+            # Suppression is TTS/display-only: the sentence stays in the
+            # raw text, so a mixed turn (real transcript + one echoed
+            # sentence) stores the echo — an all-echo turn is dropped
+            # wholesale via no_speech, which is the poisoning case.
+            if not proactive and echoes_instruction(sentence, instruction, n=6):
+                print(f"Sentence suppressed (instruction echo): {sentence!r}")
+                continue
             if tts_started_at is None:
                 tts_started_at = time.time()
             await send_json(ws, {"type": "text_delta", "text": sentence + " "})
@@ -508,12 +552,16 @@ async def run_turn(ws, messages: list, interrupted: asyncio.Event,
         f"heard: {transcript!r} → {parser.response.strip()!r}"
     )
 
+    def turn_no_speech() -> bool:
+        return (not proactive and parser.transcript is not None
+                and clean_transcript(parser.transcript) is None)
+
     if interrupted.is_set():
         print("Interrupted mid-turn")
         # An aborted turn fires nothing, so its stored text must not carry
         # a tag either — the model must not believe it already delegated.
         text = parser._filter.strip(raw["text"]) if parser._filter else raw["text"]
-        return text, [], stream.prompt_tokens
+        return text, [], stream.prompt_tokens, turn_no_speech()
 
     await send_json(ws, {
         "type": "turn_final",
@@ -526,7 +574,7 @@ async def run_turn(ws, messages: list, interrupted: asyncio.Event,
     if audio_state["started"]:
         await send_json(ws, {"type": "audio_end",
                              "tts_time": timings.get("tts_time", 0)})
-    return raw["text"], parser.tags, stream.prompt_tokens
+    return raw["text"], parser.tags, stream.prompt_tokens, turn_no_speech()
 
 
 async def prime_cache(messages: list) -> None:

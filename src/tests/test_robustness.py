@@ -60,7 +60,10 @@ def test_context_rotation_survives(server, session):
     small LLAMA_CTX to make this cheap) — the session must keep working."""
     server.require_managed()
     rotated = False
-    for _ in range(8):
+    # Generous turn budget: how fast history grows depends on the token
+    # estimate and CONTEXT_HEADROOM tuning, and the loop exits early the
+    # moment rotation fires.
+    for _ in range(14):
         t = session.turn({**audio("capital_france"), "image": fx.make_image_b64()}, timeout=120)
         assert t.marker == "complete", f"turn failed before/during rotation: {t}"
         if "dropping" in server.log():
