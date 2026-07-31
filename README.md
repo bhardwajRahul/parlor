@@ -37,6 +37,8 @@ Browser (playback + transcript)
 - **Streaming decode → TTS.** The reply opens with a one-line transcript of what you said (committing to it first measurably improves both transcript and response accuracy, and it appears on screen immediately), then the response is spoken sentence-by-sentence while the model is still generating.
 - **Speculative prefill during speech.** The camera frame is sent the moment you start speaking, and your speech itself streams to the server in ~3s chunks — both are pushed through llama.cpp's prompt cache while you're still talking, so at the end of a long question almost everything is already processed.
 - **Barge-in.** Interrupt the AI mid-sentence by speaking; generation is aborted server-side. Echo is handled without the browser's echo canceller (which muffles both the TTS voice and your barge-in on macOS): a sustained-speech gate plus a prompt rule — or just wear headphones.
+- **Background research delegation** (optional). Ask something that needs web search or real reasoning — "find the best pizza in Rome right now" — and the local model hands the task to a frontier model on any OpenAI-compatible endpoint (OpenRouter by default, with web search), keeps the conversation going, and speaks the answer when it comes back. Off unless `REASONER_API_KEY` is set; without it Parlor stays fully on-device.
+- **Live translation mode.** Say "translate everything I say into English" and Parlor becomes a consecutive interpreter: each utterance is rendered in English after a short silence window (no turn-completeness holds, no conversational replies), in any language Gemma understands. Say "stop translating" — or hit the stop chip — to return to conversation. One-way into English for now; the TTS voice is per-mode, so more Kokoro output languages are a config away.
 
 ## Requirements
 
@@ -76,6 +78,11 @@ Models are downloaded automatically on first run (~5.7 GB for Gemma 4 E4B QAT + 
 | `LLAMA_CTX`        | `16384`                        | llama.cpp context size. The server drops the oldest exchanges shortly before it fills |
 | `LLAMA_PORT`       | `8081`                         | Port for the spawned llama-server              |
 | `LLAMA_SERVER_URL` | (spawn our own)                | Use an already-running llama-server instead    |
+| `REASONER_API_KEY` | (unset — delegation off)       | API key for the background reasoner endpoint   |
+| `REASONER_BASE_URL`| `https://openrouter.ai/api/v1` | Any OpenAI-compatible chat endpoint            |
+| `REASONER_MODEL`   | `anthropic/claude-sonnet-4.5`  | Model the endpoint should run                  |
+| `REASONER_WEB_SEARCH` | `1`                         | On OpenRouter, append `:online` for web search |
+| `REASONER_TIMEOUT` | `90`                           | Seconds before a background task fails         |
 
 ## Performance (Apple M3 Pro)
 
@@ -120,6 +127,8 @@ src/
 ├── server.py              # FastAPI app + per-connection conversation loop
 ├── llama.py               # llama-server lifecycle + chat API client
 ├── pipeline.py            # Streaming turn pipeline (decode → sentences → TTS)
+├── reasoner.py            # Background research delegation (OpenAI-compatible)
+├── modes.py               # Session modes (conversation, translate)
 ├── turn_detector.py       # smart-turn-v3 end-of-turn classifier
 ├── whisper_features.py    # Log-mel features for the turn detector
 ├── tts.py                 # Platform-aware TTS (MLX on Mac, ONNX on Linux)

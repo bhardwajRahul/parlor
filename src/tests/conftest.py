@@ -7,10 +7,13 @@ PARLOR_TEST_URL=ws://host:port/ws to test an already-running server instead
 (log- and process-based tests skip).
 """
 
+import http.server
+import json
 import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from dataclasses import dataclass
@@ -25,7 +28,71 @@ import fixtures  # noqa: E402
 
 TEST_PORT = 8821
 TEST_LLAMA_PORT = 8822
+TEST_REASONER_PORT = 8823
 STARTUP_TIMEOUT_S = 300
+
+# Distinctive so a delivery turn provably carries the reasoner's facts.
+# The stalled weather task gets a weather-shaped answer: the delivery
+# prompt demands word-for-word relay, and a mismatched answer (pizza for
+# a weather question) makes the model reject it and hallucinate instead.
+MOCK_ANSWER = ("The clear winner right now is Pizzarium Bonci near the "
+               "Vatican, famous for its crispy square pizza slices.")
+MOCK_WEATHER_ANSWER = ("The weather in Naples right now is sunny and "
+                       "twenty-nine degrees, with clear skies all afternoon.")
+
+
+class _ReasonerHandler(http.server.BaseHTTPRequestHandler):
+    """OpenAI-compatible chat endpoint the suite's server delegates to.
+    Task-text triggers keep the paths deterministic: 'stock' → 500 (the
+    failure path, see delegate_stock), 'naples' → an 8s stall (the
+    conversation-continues-while-pending path, see delegate_naples). It
+    also insists on the real request shape — a dropped auth header or a
+    wrong path must fail loudly, not pass silently."""
+
+    def do_POST(self):
+        if (not self.path.endswith("/chat/completions")
+                or not self.headers.get("Authorization", "").startswith("Bearer ")):
+            self.send_response(401)
+            self.end_headers()
+            return
+        raw = self.rfile.read(int(self.headers["Content-Length"]))
+        self.server.requests.append(json.loads(raw))
+        low = raw.lower()
+        if b"stock" in low:
+            self.send_response(500)
+            self.end_headers()
+            return
+        answer = MOCK_ANSWER
+        if b"naples" in low:
+            time.sleep(8)
+            answer = MOCK_WEATHER_ANSWER
+        payload = json.dumps(
+            {"choices": [{"message": {"content": answer}}]}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, *args):  # keep pytest output clean
+        pass
+
+
+@pytest.fixture(scope="session")
+def reasoner_mock():
+    if os.environ.get("PARLOR_TEST_URL"):
+        yield None  # the external server has its own reasoner config
+        return
+    with socket.socket() as s:
+        if s.connect_ex(("127.0.0.1", TEST_REASONER_PORT)) == 0:
+            pytest.fail(f"port {TEST_REASONER_PORT} is already in use — kill "
+                        f"the stale mock (lsof -ti :{TEST_REASONER_PORT}) and rerun")
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", TEST_REASONER_PORT),
+                                          _ReasonerHandler)
+    srv.requests = []
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    yield srv
+    srv.shutdown()
 
 
 @dataclass
@@ -43,7 +110,7 @@ class Server:
 
 
 @pytest.fixture(scope="session")
-def server(tmp_path_factory) -> Server:
+def server(tmp_path_factory, reasoner_mock) -> Server:
     fixtures.generate_all()
 
     external = os.environ.get("PARLOR_TEST_URL")
@@ -64,9 +131,19 @@ def server(tmp_path_factory) -> Server:
     log_path = tmp_path_factory.mktemp("server") / "server.log"
     # MODEL pinned so changing the product default can't silently change
     # what the suite measures ("e2b" also passes and is ~2x faster if you
-    # are iterating on tests).
+    # are iterating on tests). The reasoner points at the suite's mock, so
+    # every e2e test runs under the delegation-enabled system prompt —
+    # exactly what production runs when a key is configured.
+    # TEMPERATURE pinned to 0: the suite verifies machinery and must be
+    # deterministic — at 0.7 every delegation/mode-switch ask is a ~0.8
+    # coin flip and some run always loses one. Production recall at real
+    # temperature is tagbench --production's job, not the suite's.
     env = {**os.environ, "PORT": str(TEST_PORT), "LLAMA_PORT": str(TEST_LLAMA_PORT),
-           "LLAMA_CTX": "4096", "MODEL": os.environ.get("MODEL", "e4b")}
+           "LLAMA_CTX": "4096", "MODEL": os.environ.get("MODEL", "e4b"),
+           "TEMPERATURE": os.environ.get("TEMPERATURE", "0"),
+           "REASONER_BASE_URL": f"http://127.0.0.1:{TEST_REASONER_PORT}/v1",
+           "REASONER_API_KEY": "test-key", "REASONER_MODEL": "mock-model",
+           "REASONER_TIMEOUT": "20"}
     env.pop("LLAMA_SERVER_URL", None)
     with open(log_path, "w") as log:
         proc = subprocess.Popen([sys.executable, "server.py"], cwd=SRC, env=env,

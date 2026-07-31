@@ -63,6 +63,82 @@ FIXTURES = {
         "Can you remind me what my name is?",
         ["name"],
     ),
+    # Transcript-stability fillers (tests/test_transcription_stability.py):
+    # each carries content words unique across the whole fixture set, so a
+    # transcript that borrows another turn's words is provably written from
+    # history, not from the audio. Plain statements on purpose — no
+    # search/current-info phrasing that would fire <delegate>.
+    "filler_color": (
+        "My favorite color is turquoise, like the sea near my childhood home.",
+        ["turquoise"],
+    ),
+    "filler_pet": (
+        "I adopted a golden retriever puppy last month and named him Biscuit.",
+        ["biscuit"],
+    ),
+    "filler_baking": (
+        "On weekends I like to bake sourdough bread with rosemary and olives.",
+        ["sourdough"],
+    ),
+    "filler_novel": (
+        "I have been reading a mystery novel set in Lisbon about a missing violin.",
+        ["lisbon"],
+    ),
+    "filler_jazz": (
+        "Lately I have been listening to a lot of jazz piano records in the evening.",
+        ["jazz"],
+    ),
+    "filler_garden": (
+        "This spring I want to plant tomatoes and basil on my balcony.",
+        ["basil"],
+    ),
+    # Delegation e2e: explicit "search the web" phrasing so the model
+    # reliably emits the <delegate> tag (see benchmarks/tagbench.py).
+    "delegate_pizza": (
+        "Can you search the web and find the best pizza place in Rome "
+        "right now?",
+        ["pizza", "rome"],
+    ),
+    # "stock" in the task makes the suite's mock reasoner fail the request
+    # (tests/conftest.py) — the failure path must end in a spoken apology.
+    "delegate_stock": (
+        "Can you search the web for the current stock price of Apple?",
+        ["stock", "apple"],
+    ),
+    # "naples" makes the mock stall 8s — long enough to prove the
+    # conversation continues while a background task runs. Current-info
+    # phrasing on purpose: for topics the model believes it knows (e.g.
+    # "the history of pizza") it acks without the tag often enough to
+    # flake, no matter how the request is worded.
+    "delegate_naples": (
+        "Can you search the web for today's weather in Naples, Italy?",
+        ["weather", "naples"],
+    ),
+    # Alternate phrasings for the delegation tests' retry: re-sending the
+    # SAME audio tends to reproduce the same tagless completion (cached
+    # prefix, near-deterministic sampling), so a retry only decorrelates
+    # with different words. Trigger keywords ('stock', 'naples') preserved.
+    "delegate_pizza_alt": (
+        "Please look up the best pizza places in Rome right now.",
+        ["pizza", "rome"],
+    ),
+    "delegate_stock_alt": (
+        "Please look up Apple's current stock price on the web for me.",
+        ["stock", "apple"],
+    ),
+    "delegate_naples_alt": (
+        "Please look up the current weather in Naples, Italy for me.",
+        ["weather", "naples"],
+    ),
+    # Mode-switch voice commands (translation e2e).
+    "cmd_translate": (
+        "From now on, please translate everything I say into English.",
+        ["translate"],
+    ),
+    "cmd_stop_translate": (
+        "Okay, stop translating now and go back to normal conversation.",
+        ["stop"],
+    ),
 }
 
 # Synthesis kwargs (see _synthesize) for base fixtures that need them.
@@ -75,7 +151,10 @@ BASE_KWARGS = {"incomplete_cutoff": {"keep_frac": 0.55}}
 VARIANTS = {
     "capital_france_clipped": ("capital_france", {"clip_end_s": 0.18}),
     "capital_france_noisy": ("capital_france", {"snr_db": 12}),
-    "long_question_male": ("long_question", {"voice": "am_michael"}),
+    # am_adam holds a clear margin below smart-turn's 0.5 threshold after
+    # the int16 WAV round-trip (0.25); am_michael sat at ~0.5 and flipped
+    # with synthesis drift, breaking the held-turn tests.
+    "long_question_male": ("long_question", {"voice": "am_adam"}),
 }
 
 
@@ -134,6 +213,26 @@ def generate_all(force: bool = False) -> None:
         pcm = _synthesize(backend, text, **kwargs)
         _write_wav(FIXTURES_DIR / f"{name}.wav", pcm, TARGET_SR)
         print(f"fixture {name}: {len(pcm) / TARGET_SR:.1f}s speech")
+
+
+def breath_wav_b64(seconds: float = 1.2, level: float = 0.03, seed: int = 7) -> str:
+    """Non-speech audio like a VAD false trigger captures: low-pass noise
+    with a breath-like swell (level scales the pre-envelope RMS). Long
+    enough to pass the server's valid_audio check, seeded so every run
+    sends identical bytes."""
+    n = int(seconds * TARGET_SR)
+    rng = np.random.default_rng(seed)
+    noise = np.convolve(rng.standard_normal(n).astype(np.float32),
+                        np.ones(48, dtype=np.float32) / 48, mode="same")
+    env = np.sin(np.linspace(0, np.pi, n)).astype(np.float32) ** 2
+    pcm = noise / (np.sqrt(np.mean(noise**2)) + 1e-9) * level * env
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(TARGET_SR)
+        w.writeframes((pcm * 32767).clip(-32768, 32767).astype(np.int16).tobytes())
+    return base64.b64encode(buf.getvalue()).decode()
 
 
 def load_wav_b64(name: str) -> str:

@@ -86,7 +86,10 @@ class Session:
         return self.collect_turn(timeout)
 
     def collect_turn(self, timeout: float = 90) -> Turn:
-        """Read messages until the current turn reaches a terminal state."""
+        """Read messages until the current turn reaches a terminal state.
+        Every terminal state also sends 'ready', mirroring the browser
+        (which announces idle when playback ends) — the server holds
+        delegation deliveries until it hears it."""
         t = Turn()
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -104,17 +107,30 @@ class Session:
             elif kind == "turn_incomplete":
                 t.marker = "incomplete"
                 t.p_complete = msg.get("p_complete")
+                self.send({"type": "ready"})
                 return t
             elif kind == "turn_final":
                 t.transcription = msg.get("transcription")
                 t.timings = msg.get("timings", {})
                 if not msg.get("spoke", True):
                     t.marker = "released"
+                    self.send({"type": "ready"})
                     return t
             elif kind == "audio_end":
                 t.marker = "complete"
+                self.send({"type": "ready"})
                 return t
         return t
+
+    def wait_for(self, kind: str, timeout: float = 30) -> dict | None:
+        """Read messages until one of type `kind` arrives (others are
+        discarded); None on timeout."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            msg = self.recv(timeout=max(0.1, deadline - time.time()))
+            if msg and msg.get("type") == kind:
+                return msg
+        return None
 
     def send_speech_chunks(self, chunks: list[str], gap_s: float = 1.0) -> None:
         """Stream all but the last chunk like the client does during speech."""

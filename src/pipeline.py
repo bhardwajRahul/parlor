@@ -119,6 +119,105 @@ async def release_client(ws) -> None:
 
 # ── streaming turn parser ─────────────────────────────────────────────────
 
+class TagFilter:
+    """Streams response text through, extracting complete
+    '<name>value</name>' control elements into .tags. XML elements (not
+    ###NAME: lines) because the model emits them more reliably —
+    benchmarks/tagbench.py measured recall 0.667 vs 0.417 on E4B — and
+    the explicit close tag means a half-streamed value can never fire.
+
+    Parsed tolerantly ('< delegate >x</delegate>' extracts — firing the
+    intended action beats suppressing it) and the value may contain '<'
+    ('flights under <$500'); only the close tag terminates it. Anything
+    that names a control tag without being a clean element (a stray
+    '</delegate>', '<delegate x=1>') suppresses all further speech,
+    mirroring the ##-markup rule: it is model error, and speaking it —
+    task text included — is the worst outcome. Ordinary prose '<'
+    ('5 < 10') passes through. Markup still open when the stream ends is
+    dropped, never spoken and never fired: a delegation with half its
+    task is worse than none."""
+
+    def __init__(self, names: tuple[str, ...]):
+        alt = "|".join(names)  # names are plain lowercase words
+        self._re = re.compile(
+            rf"<\s*(?P<name>{alt})\s*>\s*(?P<value>.*?)\s*<\s*/\s*(?P=name)\s*>",
+            re.IGNORECASE | re.DOTALL)
+        # An element left unclosed at end of stream (see finalize), and
+        # the same shape anywhere-to-end-of-text (for strip).
+        self._unclosed_re = re.compile(
+            rf"^<\s*(?P<name>{alt})\s*>\s*(?P<value>\S.*?)\s*$",
+            re.IGNORECASE | re.DOTALL)
+        self._tail_open_re = re.compile(rf"<\s*(?:{alt})\s*>.*$",
+                                        re.IGNORECASE | re.DOTALL)
+        # A complete opening bracket: the element is committed, hold until
+        # its close tag (or end of stream) decides it.
+        self._open_re = re.compile(rf"^<\s*(?:{alt})\s*>", re.IGNORECASE)
+        # Names a control tag (with optional '/' and spacing) — but only
+        # consulted after _re and _open_re failed, so it is a near-miss.
+        self._miss_re = re.compile(rf"^<\s*/?\s*(?:{alt})\b", re.IGNORECASE)
+        # Too short to judge: '<', '</', '< dele' — letters (a name prefix)
+        # possibly followed by whitespace, still awaiting a decisive char.
+        self._forming_re = re.compile(r"^<[\s/]*([a-zA-Z]*)\s*$")
+        self._names = [n.lower() for n in names]
+        self._held = ""
+        self._dead = False
+        self.tags: list[tuple[str, str]] = []  # (NAME, value), stream order
+
+    def feed(self, delta: str) -> str:
+        """Returns the speakable text released by this delta."""
+        if self._dead:
+            return ""
+        buf = self._held + delta
+        self._held = ""
+        out = []
+        while buf:
+            lt = buf.find("<")
+            if lt == -1:
+                out.append(buf)
+                break
+            out.append(buf[:lt])
+            m = self._re.match(buf, lt)
+            if m:
+                self.tags.append((m.group("name").upper(), m.group("value").strip()))
+                out.append("\n")  # keep a boundary where the element sat
+                buf = buf[m.end():]
+                continue
+            rest = buf[lt:]
+            forming = self._forming_re.match(rest)
+            if self._open_re.match(rest) or (
+                    forming and any(n.startswith(forming.group(1).lower())
+                                    for n in self._names)):
+                self._held = rest  # a clean element may still complete
+                break
+            if self._miss_re.match(rest):
+                self._dead = True  # markup, not speech — nothing more is spoken
+                break
+            out.append("<")  # literal '<', not ours
+            buf = buf[lt + 1:]
+        return "".join(out)
+
+    def finalize(self) -> None:
+        """End of stream. An element still open here is the model hitting
+        EOS before the close tag — measured live, a third of exit-command
+        '<mode>conversation' switches end exactly like that. The value is
+        as complete as it will ever be, so extract it (still never
+        spoken). A mid-stream half value can never fire — this only runs
+        when no more text is coming — and the residual truncation risk is
+        benign: an incomplete mode value no-ops, a delegation task has
+        the cap/clamp guards."""
+        m = self._unclosed_re.match(self._held)
+        if m and not self._dead:
+            self.tags.append((m.group("name").upper(), m.group("value").strip()))
+        self._held = ""
+
+    def strip(self, text: str) -> str:
+        """Remove control elements, closed or unclosed-at-end, from `text`
+        (for storing an interrupted turn: history must not claim an action
+        fired). After closed elements are gone, any remaining open tag runs
+        to the end of the text by construction."""
+        return self._tail_open_re.sub("", self._re.sub("", text))
+
+
 class StreamParser:
     """Incrementally parses '###TRANSCRIPT: <words>\\n<response>'.
 
@@ -133,16 +232,32 @@ class StreamParser:
     partial sentence and the transcript. With expect_transcript=False
     (text/image turns) the reply streams directly and any imitated
     trailing tag is cut, never spoken.
+
+    control_tags names '<name>value</name>' elements the model may emit
+    as actions (e.g. delegate, mode). A recognized element is excised by
+    a TagFilter — appended to self.tags, never spoken — and speech
+    resumes after it; '##…' markup keeps the terminal cut above.
     """
 
-    def __init__(self, expect_transcript: bool = True):
+    def __init__(self, expect_transcript: bool = True,
+                 control_tags: tuple[str, ...] = ()):
         self.response = ""
         self.transcript: str | None = None
+        self._filter = TagFilter(control_tags) if control_tags else None
         self._awaiting = expect_transcript
         self._got_tag = False
         self._buf = ""
         self._before_tag = ""  # stray text before the tag → response prefix
         self._emitted = 0
+
+    @property
+    def tags(self) -> list[tuple[str, str]]:
+        return self._filter.tags if self._filter else []
+
+    def _release(self, text: str) -> str:
+        """Response text passes through the control-tag filter (if any)
+        before it can be spoken."""
+        return self._filter.feed(text) if self._filter else text
 
     def feed(self, delta: str) -> list[str]:
         if self._awaiting:
@@ -165,11 +280,12 @@ class StreamParser:
                 m = SENTENCE_END_RE.search(self._buf)
                 newline = m.end() - 1 if m else len(self._buf) - 1
             self.transcript = self._buf[:newline].strip() or None
-            self.response = (self._before_tag + self._buf[newline + 1:]).lstrip()
+            self.response = self._release(
+                (self._before_tag + self._buf[newline + 1:]).lstrip())
             self._awaiting = False
             self._buf = ""
         else:
-            self.response += delta
+            self.response += self._release(delta)
         return self._complete_sentences()
 
     def _complete_sentences(self) -> list[str]:
@@ -199,10 +315,12 @@ class StreamParser:
                 m = SENTENCE_END_RE.search(self._buf)
                 cut = m.end() if m else len(self._buf)
                 self.transcript = self._buf[:cut].strip() or None
-                self.response = self._before_tag + self._buf[cut:]
+                self.response = self._release(self._before_tag + self._buf[cut:])
             else:
-                self.response = self._buf
+                self.response = self._release(self._buf)
             self._awaiting = False
+        if self._filter:
+            self._filter.finalize()  # an element left open at EOS still fires
         sentences = self._complete_sentences()
         # Cut any imitated tag markup — never speak it.
         tail = re.split(r"#{2,}", self.response[self._emitted:])[0].strip()
@@ -211,14 +329,82 @@ class StreamParser:
 
 # ── turn execution ────────────────────────────────────────────────────────
 
+# Spoken when a turn produced a control tag but no speech at all — an
+# action must never feel like the assistant ignored the user. Generic on
+# purpose: it stands in for a delegation ack or a mode-switch confirmation.
+TAG_ACK = "Okay — one moment."
+
+
+def _norm_words(text: str) -> list[str]:
+    return re.sub(r"[^a-z0-9' ]+", " ", text.lower()).split()
+
+
+# A transcript that is entirely a bracketed annotation — the sanctioned
+# "(no speech)" from the turn prompts, or free-form variants the model
+# produces on its own ("(noise)", "[Silence]", "*sigh*", "(background
+# noise)") — reports that there were no words. It must never be shown or
+# stored as user words. Real transcripts are plain words, never fully
+# bracketed; the length cap keeps a genuine parenthesized ramble out.
+NO_SPEECH_RE = re.compile(
+    r"^(?:\(\s*[^)]{1,40}\)|\[\s*[^\]]{1,40}\]|\*\s*[^*]{1,40}\*"
+    r"|no speech)[.!\s]*$",
+    re.IGNORECASE)
+
+
+def echoes_instruction(transcript: str, instruction: str, n: int = 5) -> bool:
+    """True when the model's transcript line is an echo of the turn's own
+    instruction text rather than the user's words — e.g. a flush turn's
+    '###TRANSCRIPT: The user paused mid-thought, so on a new line: …',
+    which the client would display as something the user said. Any run of
+    n consecutive transcript words appearing verbatim in the instruction
+    is an echo; genuine speech doesn't reproduce 5-word runs of prompt
+    text, and shorter overlaps ('what you see') are common English.
+    Double-quoted spans are stripped from the instruction first: a prompt
+    quotes phrases the user is EXPECTED to say (the translate prompt's
+    exit examples like "go back to normal conversation"), and a genuine
+    utterance reproducing one must not read as an echo."""
+    words = _norm_words(transcript)
+    if len(words) < n:
+        return False
+    instruction = re.sub(r'"[^"]*"', " ", instruction)
+    haystack = " " + " ".join(_norm_words(instruction)) + " "
+    return any(" " + " ".join(words[i:i + n]) + " " in haystack
+               for i in range(len(words) - n + 1))
+
+
+def _instruction_text(messages: list) -> str:
+    content = messages[-1].get("content", "")
+    if isinstance(content, str):
+        return content
+    return " ".join(p.get("text", "") for p in content
+                    if isinstance(p, dict) and p.get("type") == "text")
+
+
 async def run_turn(ws, messages: list, interrupted: asyncio.Event,
                    active: dict, tts_backend, expect_transcript: bool = True,
                    p_complete: float | None = None,
-                   fallback: str | None = None) -> str:
+                   control_tags: tuple[str, ...] = (),
+                   tts_voice: str = "af_heart",
+                   proactive: bool = False,
+                   fallback: str | None = None
+                   ) -> tuple[str, list, int | None, bool]:
     """Stream one model turn: decode → sentences → TTS, all pipelined. The
     transcript line is pushed to the client the moment it completes, while
-    the response is still decoding. Returns the raw generated text (stored
-    verbatim in history so the next request gets a full prefix-cache hit)."""
+    the response is still decoding. Returns the raw generated text, any
+    control tags the model emitted — empty if interrupted, so an aborted
+    turn never fires an action — the request's real prompt token count
+    when llama-server reported one (drives history rotation), and
+    no_speech: True when the model wrote a transcript line that had to be
+    rejected (a no-speech annotation, or an echo of the instruction) — no
+    user words stand behind this turn, so the caller must not store it or
+    act on its tags. A turn that merely OMITS the transcript marker is
+    not no_speech: real words were heard and answered, only the format
+    slipped.
+
+    proactive marks a server-initiated turn (delegation delivery): the
+    model's transcript line is its own echo, not the user's words, so no
+    transcript frame is sent and turn_final carries proactive=True — the
+    client must never fill a user bubble from it."""
     loop = asyncio.get_event_loop()
     t0 = time.time()
     timings: dict = {}
@@ -250,7 +436,8 @@ async def run_turn(ws, messages: list, interrupted: asyncio.Event,
                 return
             if interrupted.is_set():
                 continue  # keep draining
-            pcm = await loop.run_in_executor(None, lambda s=sentence: tts_backend.generate(s))
+            pcm = await loop.run_in_executor(
+                None, lambda s=sentence: tts_backend.generate(s, voice=tts_voice))
             if interrupted.is_set():
                 continue
             if not audio_state["started"]:
@@ -267,13 +454,43 @@ async def run_turn(ws, messages: list, interrupted: asyncio.Event,
             audio_state["chunks"] += 1
 
     tts_task = asyncio.create_task(tts_worker())
-    parser = StreamParser(expect_transcript)
+    parser = StreamParser(expect_transcript, control_tags)
     tts_started_at = None
     transcript_sent = False
+    instruction = _instruction_text(messages)
+
+    def clean_transcript(text: str | None) -> str | None:
+        """The client shows this as the user's words — never instruction
+        text the model echoed (a live flush-turn bug on real mics), and
+        never a non-speech annotation ('(no speech)', '[Silence]'): that
+        is the model reporting there were no words to transcribe."""
+        if not text:
+            return None
+        if NO_SPEECH_RE.match(text):
+            print(f"Transcript is a no-speech report: {text!r}")
+            return None
+        if echoes_instruction(text, instruction):
+            print(f"Transcript suppressed (instruction echo): {text!r}")
+            return None
+        return text
 
     async def dispatch(sentences: list[str]):
         nonlocal tts_started_at
         for sentence in sentences:
+            # A sentence that reproduces a run of the turn's own instruction
+            # is the model echoing its prompt, not speech — observed live as
+            # 'CRIPT: Begin your reply with one line:' read aloud after a
+            # degenerate transcript loop was cut mid-tag. Never on proactive
+            # turns (the delivery prompt embeds the answer being relayed),
+            # and at n=6 so short quoted phrases the user may legitimately
+            # trigger ('go back to normal conversation') still speak.
+            # Suppression is TTS/display-only: the sentence stays in the
+            # raw text, so a mixed turn (real transcript + one echoed
+            # sentence) stores the echo — an all-echo turn is dropped
+            # wholesale via no_speech, which is the poisoning case.
+            if not proactive and echoes_instruction(sentence, instruction, n=6):
+                print(f"Sentence suppressed (instruction echo): {sentence!r}")
+                continue
             if tts_started_at is None:
                 tts_started_at = time.time()
             await send_json(ws, {"type": "text_delta", "text": sentence + " "})
@@ -293,9 +510,11 @@ async def run_turn(ws, messages: list, interrupted: asyncio.Event,
                 if parser.transcript and not transcript_sent:
                     transcript_sent = True
                     timings["transcript_s"] = round(time.time() - t0, 3)
-                    await send_json(ws, {"type": "transcript",
-                                         "transcription": parser.transcript,
-                                         "p_complete": p_complete})
+                    shown = clean_transcript(parser.transcript)
+                    if shown and not proactive:
+                        await send_json(ws, {"type": "transcript",
+                                             "transcription": shown,
+                                             "p_complete": p_complete})
 
         tail, transcript = parser.finalize()
         timings["llm_time"] = round(time.time() - t0, 3)
@@ -303,13 +522,17 @@ async def run_turn(ws, messages: list, interrupted: asyncio.Event,
 
         if not interrupted.is_set():
             await dispatch(tail)
-            if fallback and tts_started_at is None:
-                # The model emitted only a transcript line (models of every
-                # size sometimes do this for cut-off audio) — a flush turn
-                # must never end in silence, so speak the fallback and keep
-                # history coherent with what was actually said.
-                raw["text"] += "\n" + fallback
-                await dispatch([fallback])
+            # A turn may still end with nothing spoken: only a transcript
+            # line (models of every size do this for cut-off audio), or only
+            # a control tag. Neither may end in silence — speak the ack or
+            # the caller's fallback, and keep history coherent with what was
+            # actually said.
+            # A proactive (delivery) turn always prefers its fallback: it IS
+            # the answer, and a stray tag must not replace it with an ack.
+            say = fallback if proactive else (TAG_ACK if parser.tags else fallback)
+            if tts_started_at is None and say:
+                raw["text"] += "\n" + say
+                await dispatch([say])
     finally:
         active["stream"] = None
         sentence_q.put_nowait(_DONE)
@@ -329,13 +552,21 @@ async def run_turn(ws, messages: list, interrupted: asyncio.Event,
         f"heard: {transcript!r} → {parser.response.strip()!r}"
     )
 
+    def turn_no_speech() -> bool:
+        return (not proactive and parser.transcript is not None
+                and clean_transcript(parser.transcript) is None)
+
     if interrupted.is_set():
         print("Interrupted mid-turn")
-        return raw["text"]
+        # An aborted turn fires nothing, so its stored text must not carry
+        # a tag either — the model must not believe it already delegated.
+        text = parser._filter.strip(raw["text"]) if parser._filter else raw["text"]
+        return text, [], stream.prompt_tokens, turn_no_speech()
 
     await send_json(ws, {
         "type": "turn_final",
-        "transcription": transcript,
+        "transcription": None if proactive else clean_transcript(transcript),
+        "proactive": proactive,
         "timings": timings,
         "p_complete": p_complete,
         "spoke": audio_state["started"],  # False → client must not wait for audio_end
@@ -343,7 +574,7 @@ async def run_turn(ws, messages: list, interrupted: asyncio.Event,
     if audio_state["started"]:
         await send_json(ws, {"type": "audio_end",
                              "tts_time": timings.get("tts_time", 0)})
-    return raw["text"]
+    return raw["text"], parser.tags, stream.prompt_tokens, turn_no_speech()
 
 
 async def prime_cache(messages: list) -> None:
