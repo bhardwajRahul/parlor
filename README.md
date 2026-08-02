@@ -2,7 +2,7 @@
 
 Fully on-device, real-time multimodal AI, with features similar to [GPT-Live](https://openai.com/index/introducing-gpt-live/).
 
-https://github.com/user-attachments/assets/cb0ffb2e-f84f-48e7-872c-c5f7b5c6d51f
+https://github.com/user-attachments/assets/0833b0ec-9e48-46dc-9fde-c3ac4a70abf9
 
 > **Research preview.** This is an early experiment. Expect rough edges and bugs.
 
