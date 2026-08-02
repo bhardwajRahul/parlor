@@ -52,7 +52,7 @@ Browser (playback + transcript)
 ## Requirements
 
 - Python 3.12+
-- [llama.cpp](https://github.com/ggml-org/llama.cpp) (`brew install llama.cpp` on macOS; other platforms: [install guide](https://github.com/ggml-org/llama.cpp/blob/master/docs/install.md)). Needs build b9503 (June 2026) or newer — older builds lack Gemma 4 audio or crash loading its mmproj
+- [llama.cpp](https://github.com/ggml-org/llama.cpp) (`brew install llama.cpp` on macOS; other platforms: [install guide](https://github.com/ggml-org/llama.cpp/blob/master/docs/install.md)). Needs build b9503 (June 2026) or newer, b9512 for `MODEL=12b` — older builds lack Gemma 4 audio or crash loading its mmproj
 - macOS with Apple Silicon, or Linux with a supported GPU
 - ~6 GB free RAM for the default E4B model (`MODEL=e2b` fits in ~4 GB)
 
@@ -144,6 +144,7 @@ benchmarks/
 ├── compare.py             # Diff two benchmark result files
 ├── turnbench.py           # Turn-detection accuracy benchmark
 ├── archbench.py           # In-band control tags vs decoupled action head
+├── camerabench.py         # Attach-every-turn vs camera-as-tool-call
 └── timerprobe.py          # Why the server owns the timer clock
 ```
 

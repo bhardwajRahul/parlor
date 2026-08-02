@@ -108,7 +108,7 @@ def server_command() -> list[str]:
     raise RuntimeError(f"llama-server not found — install llama.cpp: {_hint('install')}")
 
 
-def check_build(cmd: list[str], floor: int = MIN_BUILD) -> None:
+def check_build(cmd: list[str], floor: int) -> None:
     """Refuse to start on a llama.cpp build below the model's floor. The
     version is probed on the root binary (`llama serve --version` may not
     exit). Its line looks like 'version: 10150 (dee2a846b)'; a binary

@@ -9,7 +9,7 @@ config is read once at import.
 
 | Variable      | Default                        | Description |
 | ------------- | ------------------------------ | ----------- |
-| `MODEL`       | `e4b`                          | Gemma 4 size: `e2b` (fastest), `e4b` (better answers, ~1.8x e2b latency), `12b` (needs ~8GB) |
+| `MODEL`       | `e4b`                          | Gemma 4 size: `e2b` (fastest), `e4b` (better answers, ~1.8x e2b latency), `12b` (needs ~8GB and llama.cpp b9512+) |
 | `MODEL_PATH`  | auto-download from HuggingFace | Path to a local Gemma 4 `.gguf` file (overrides `MODEL`) |
 | `MMPROJ_PATH` | auto-download from HuggingFace | Path to the matching `mmproj` `.gguf` (audio + vision encoders) |
 
