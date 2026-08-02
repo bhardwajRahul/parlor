@@ -548,18 +548,31 @@ async def websocket_endpoint(ws: WebSocket):
         await send_json(ws, {"type": "timer_started", "id": timer_id,
                              "label": label, "seconds": seconds})
 
-    async def apply_decision(decision, only_mode: bool = False) -> None:
-        """Fire what the decider found. only_mode in translate/listen:
-        those sessions render or transcribe — a timer or research ask
-        mid-interpretation stays content until the user exits (the same
-        gating the flags on Mode encode for deliveries)."""
-        if not only_mode:
+    async def apply_decision(decision) -> None:
+        """Fire what the decider found. Timers/research fire when the
+        turn is conversational at EITHER end of a mode transition: a
+        plain conversation turn, or a listen/translate exit whose same
+        breath asks for more ("okay, I'm done — set a twenty-minute
+        timer": the exit turn confirms it aloud, so dropping it would be
+        a spoken promise with no action — review finding). A mention
+        mid-translate/listen without an exit stays content. Ordering
+        keeps spawn_delegation's allows_delegation gate live: entries
+        spawn before the switch, exits switch first."""
+        if mode.name == "conversation":
             if decision.timer:
                 await spawn_timer(*decision.timer)
             if decision.research:
                 await spawn_delegation(decision.research)
+            if decision.mode:
+                await switch_mode(decision.mode)
+            return
         if decision.mode:
             await switch_mode(decision.mode)
+        if mode.name == "conversation":  # exited just now
+            if decision.timer:
+                await spawn_timer(*decision.timer)
+            if decision.research:
+                await spawn_delegation(decision.research)
 
     async def deliver_timer(done: dict) -> None:
         """The ring. Its label and duration ride the event, not the pending
@@ -810,11 +823,7 @@ async def websocket_endpoint(ws: WebSocket):
                     # "asked" to translate everything — measured live), or
                     # the user cut it off: nothing may act.
                     decision = actions.NONE
-                # Outside conversation, only mode exits fire: a translated
-                # or thought-aloud mention of a timer is content, not a
-                # request (the same policy Mode flags encode for research).
-                await apply_decision(decision,
-                                     only_mode=mode.name != "conversation")
+                await apply_decision(decision)
                 remember(user_msg, raw_text, no_speech)
                 last_activity["t"] = time.time()
             except DISCONNECT_ERRORS:

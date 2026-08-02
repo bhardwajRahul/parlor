@@ -127,7 +127,11 @@ def _decide(build, current_mode: str) -> ActionDecision:
     decision is a no-op turn, never an exception in the turn loop."""
     try:
         head_prompt = _HEAD_COMMON.format(mode_clause=_MODE_CLAUSES[current_mode])
-        raw = llama.chat_blocking(build(head_prompt), max_tokens=64,
+        # max_tokens must clear the JSON skeleton (~30 tokens) PLUS a long
+        # restated research task — truncated JSON fails json.loads and
+        # silently drops an action the reply already promised (review
+        # finding). The grammar bounds the shape, so the cap is generous.
+        raw = llama.chat_blocking(build(head_prompt), max_tokens=192,
                                   temperature=0.0, json_schema=HEAD_SCHEMA)
         head = json.loads(raw)
     except Exception as e:
@@ -138,8 +142,12 @@ def _decide(build, current_mode: str) -> ActionDecision:
     if isinstance(seconds, int) and seconds > 0:
         timer = (seconds, str(head.get("timer_label", "")).strip())
     target = head.get("mode")
-    mode = target if target in ("translate", "listen", "conversation") \
-        and target != current_mode else None
+    # Mid-translate/listen the only sanctioned transition is OUT — the
+    # clauses ask only about exits, so any other target is a misread
+    # (a phantom listen→translate jump would answer aloud mid-listen).
+    allowed = (("translate", "listen", "conversation")
+               if current_mode == "conversation" else ("conversation",))
+    mode = target if target in allowed and target != current_mode else None
     research = str(head.get("research_task", "")).strip() or None
     decision = ActionDecision(timer=timer, mode=mode, research=research)
     if decision.any():

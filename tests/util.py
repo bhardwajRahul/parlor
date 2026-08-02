@@ -147,9 +147,9 @@ class Session:
 def switch_by_voice(session: Session, fixture: str, target: str,
                     tries: int = 2) -> Turn:
     """Speak a mode-switch command and wait for the server to confirm it;
-    like delegation tags, the model occasionally confirms without emitting
-    the tag — one retry keeps the suite stable, two misses is a real
-    regression. Returns the switching turn (callers assert on its reply)."""
+    retry with the same audio if the action decider misses — one retry
+    keeps the suite stable, two misses is a real regression. Returns the
+    switching turn (callers assert on its reply)."""
     for _ in range(tries):
         t = session.turn(audio(fixture))
         if t.marker == "incomplete":

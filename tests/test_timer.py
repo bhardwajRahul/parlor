@@ -8,9 +8,9 @@ from util import switch_by_voice
 
 
 def set_timer_turn(session, fixture="cmd_timer_short", tries=2):
-    """Speak a timer request and wait for timer_started; like delegation
-    tags, retry with an alternate phrasing when the model confirms without
-    emitting the tag (same audio would reproduce the same completion)."""
+    """Speak a timer request and wait for timer_started; retry with an
+    alternate phrasing if the action decider misses (re-sending the same
+    audio would reproduce the same reply and decision)."""
     for attempt in range(tries):
         name = fixture if attempt == 0 else f"{fixture}_alt"
         t = session.turn(util.audio(name))
