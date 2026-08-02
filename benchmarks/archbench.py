@@ -65,6 +65,11 @@ MODE_CASES = {
                            "into English.",
     "arch_mode_listen": "Please just listen quietly for a while and don't "
                         "respond. I want to think out loud.",
+    # Live-session failures (2026-08-02): "stay silent" phrasings missed
+    # the listen clause entirely, and the "for one minute" variant fired
+    # a 60s TIMER that rang into the wanted silence.
+    "arch_mode_silent": "Can you stay silent for a while?",
+    "arch_mode_silent_minute": "Can you stay silent for one minute?",
 }
 MODE_TRAP_CASES = {
     "arch_trap_jazz": "Lately I have been listening to a lot of jazz piano "
@@ -80,6 +85,8 @@ EXPECTED: dict[str, tuple | None] = {
     **{n: ("research", None) for n in DELEGATE_CASES},
     "arch_mode_translate": ("mode", "translate"),
     "arch_mode_listen": ("mode", "listen"),
+    "arch_mode_silent": ("mode", "listen"),
+    "arch_mode_silent_minute": ("mode", "listen"),
     "arch_trap_jazz": None, "arch_trap_french": None,
 }
 ALL_CASES = (TIMER_CASES | TIMER_PLAIN_CASES | DELEGATE_CASES
@@ -126,8 +133,38 @@ GATE_SCHEMA = {"type": "object",
                "required": ["answer"]}
 
 
+# The fast head: hand-written GBNF instead of a json_schema. Absent
+# fields are OMITTED and "nothing asked" is a two-token "{}" — the
+# no-action gate collapsed into the head's first token. Short keys and
+# forbidden whitespace because even grammar-forced skeleton tokens each
+# cost a forward pass.
+FAST_GRAMMAR = r'''
+root ::= "{}" | "{" timer "}" | "{" mode "}" | "{" res "}" | "{" timer "," mode "}" | "{" timer "," res "}" | "{" mode "," res "}" | "{" timer "," mode "," res "}"
+timer ::= "\"seconds\": " num ", \"l\": \"" str "\""
+mode ::= "\"m\": \"" ("translate" | "listen" | "conversation") "\""
+res ::= "\"r\": \"" str "\""
+num ::= [1-9] [0-9]?  [0-9]? [0-9]? [0-9]?
+str ::= [^"\\\x00-\x1f]  [^"\\\x00-\x1f]*
+'''
+
+FAST_HEAD_PROMPT = (
+    "System note (not user audio): report as compact JSON what the user "
+    "just asked the assistant to DO. Omit anything they didn't ask for; "
+    "output {} if nothing. \"seconds\": timer or reminder duration "
+    "converted to seconds (two minutes → 120), with \"l\": a "
+    "two-or-three-word label. \"m\": mode they asked to "
+    "switch to (\"translate\" everything they say / \"listen\" quietly "
+    "without responding / \"conversation\" = back to normal; the session "
+    "is in normal conversation now). \"r\": a research, search, or "
+    "look-up task, or any question about something current or changing "
+    "(weather, news, prices, scores) — restated to stand alone; stable "
+    "general knowledge is not research. Merely mentioning a duration or "
+    "topic is not asking."
+)
+
+
 def chat(messages: list, *, max_tokens: int = 256, temperature: float | None = None,
-         json_schema: dict | None = None) -> str:
+         json_schema: dict | None = None, grammar: str | None = None) -> str:
     """Direct llama-server call with per-request temperature and an
     optional enforced JSON schema (llama.cpp compiles it to a grammar)."""
     body: dict = {"messages": messages, "max_tokens": max_tokens,
@@ -137,6 +174,8 @@ def chat(messages: list, *, max_tokens: int = 256, temperature: float | None = N
     if json_schema:
         body["response_format"] = {"type": "json_schema",
                                    "json_schema": {"schema": json_schema}}
+    if grammar:
+        body["grammar"] = grammar
     conn = http.client.HTTPConnection(*llama.host_port(), timeout=300)
     conn.request("POST", "/v1/chat/completions", json.dumps(body),
                  {"Content-Type": "application/json"})
@@ -223,6 +262,34 @@ def run_arch_b(wav: str) -> tuple[dict, str, dict]:
     return acts, spoken, {"raw": reply, "head": head_raw, "head_ms": head_ms}
 
 
+def run_arch_b_fast(wav: str) -> tuple[dict, str, dict]:
+    """The fast head: omit-absent compact GBNF ('{}' when nothing asked)
+    + a tightened instruction. Same decision, a fraction of the tokens."""
+    speech_msgs = [{"role": "system", "content": B_SYSTEM},
+                   {"role": "user", "content": [audio_part(wav),
+                                                text_part(B_RESPOND)]}]
+    reply = chat(speech_msgs)
+    t0 = time.time()
+    head_raw = chat(speech_msgs + [{"role": "assistant", "content": reply},
+                                   {"role": "user", "content": FAST_HEAD_PROMPT}],
+                    max_tokens=64, temperature=0.0, grammar=FAST_GRAMMAR)
+    head_ms = round((time.time() - t0) * 1000)
+    try:
+        head = json.loads(head_raw)
+    except ValueError:
+        head = {}
+    acts: dict = {"timer": None, "mode": None, "research": None}
+    secs = head.get("seconds") or 0
+    if 0 < secs <= server.MAX_TIMER_S:
+        acts["timer"] = (secs, head.get("l", ""))
+    if head.get("m") in ("translate", "listen"):
+        acts["mode"] = head["m"]
+    if (head.get("r") or "").strip():
+        acts["research"] = head["r"].strip()
+    spoken = reply.split("\n", 1)[1] if "\n" in reply else reply
+    return acts, spoken, {"raw": reply, "head": head_raw, "head_ms": head_ms}
+
+
 def run_arch_b_gated(wav: str) -> tuple[dict, str, dict]:
     """The cascade: speech → 1-token gate → full head only on 'yes'."""
     speech_msgs = [{"role": "system", "content": B_SYSTEM},
@@ -288,6 +355,7 @@ def score(results: list[dict]) -> dict:
 
 
 RUNNERS = {"A_tags": run_arch_a, "B_head": run_arch_b,
+           "B_fast": run_arch_b_fast,
            "B_gated": run_arch_b_gated}
 
 

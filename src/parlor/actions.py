@@ -41,8 +41,10 @@ _HEAD_COMMON = (
     "user's last message (the assistant's reply above may help), report "
     "what the user asked the assistant to DO, as JSON. timer_seconds: "
     "the countdown duration in seconds if they asked for a timer or a "
-    "timed reminder, else 0. timer_label: a two-or-three-word label for "
-    "it, else empty. {mode_clause} research_task: if they asked to "
+    "timed reminder, else 0 — asking the assistant to be quiet for some "
+    "time is a mode request, never a timer. timer_label: a "
+    "two-or-three-word label for it, else empty. {mode_clause} "
+    "research_task: if they asked to "
     "search, look up, or research something, or asked about anything "
     "current or changing (weather, news, prices, scores, openings, "
     "\"right now\", \"today\"), the task restated to stand alone, else "
@@ -52,8 +54,9 @@ _HEAD_COMMON = (
 _MODE_CLAUSES = {
     "conversation": (
         "mode: the mode they asked to SWITCH TO — 'translate' (translate "
-        "everything they say from now on), 'listen' (just listen "
-        "quietly, don't respond) — the session is already in normal "
+        "everything they say from now on), 'listen' (any ask for the "
+        "assistant to just listen, stay silent or quiet, or stop "
+        "responding for a while) — the session is already in normal "
         "conversation, so mode is 'none' unless they asked to change it."),
     "translate": (
         "mode: 'conversation' ONLY if their words are a command to the "
