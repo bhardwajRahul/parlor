@@ -774,7 +774,7 @@ async function init() {
     negativeSpeechThreshold: 0.25,
     // Short redemption for fast turn-taking; the server's smart-turn
     // classifier catches the cases where the user was merely pausing.
-    redemptionMs: 200,
+    redemptionMs: 300,
     minSpeechMs: 300,
     preSpeechPadMs: 300,
     onSpeechStart: handleSpeechStart,
