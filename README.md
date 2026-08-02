@@ -1,8 +1,6 @@
 # Parlor
 
-On-device, real-time multimodal AI. Have natural voice and vision conversations with an AI that runs entirely on your machine.
-
-Parlor uses [Gemma 4 E4B](https://huggingface.co/google/gemma-4-E4B-it) for understanding speech and vision (switchable to E2B or 12B), and [Kokoro](https://huggingface.co/hexgrad/Kokoro-82M) for text-to-speech. You talk, show your camera, and it talks back, all locally.
+Fully on-device, real-time multimodal AI, with features similar to [GPT-Live](https://openai.com/index/introducing-gpt-live/).
 
 https://github.com/user-attachments/assets/cb0ffb2e-f84f-48e7-872c-c5f7b5c6d51f
 
@@ -10,15 +8,17 @@ https://github.com/user-attachments/assets/cb0ffb2e-f84f-48e7-872c-c5f7b5c6d51f
 
 # Why?
 
-I'm [self-hosting a totally free voice AI](https://www.fikrikarim.com/bule-ai-initial-release/) on my home server to help people learn speaking English. It has hundreds of monthly active users, and I've been thinking about how to keep it free while making it sustainable.
+I'm [self-hosting a totally free voice AI](https://www.fikrikarim.com/bule-ai-initial-release/) on my home server to help people learn speaking English. It has hundreds of monthly active users, and I spent weeks improving it until it's almost on par with ChatGPT Advanced Voice.
 
-The obvious answer: run everything on-device, eliminating any server cost. Six months ago I needed an RTX 5090 to run just the voice models in real-time.
+Then, my heart broke when OpenAI released [GPT-Live](https://openai.com/index/introducing-gpt-live/), which is miles ahead of ChatGPT Advanced Voice. GPT-Live is so good that I use it almost every day. It made my app feel obsolete. I either need to redirect my users to GPT-Live, or update the app to match it. I chose to try, with the additional constraint that it had to run 100% locally on my MacBook M3 Pro.
 
-Google just released a super capable small model that I can run on my M3 Pro in real-time, with vision too! Sure you can't do agentic coding with this, but it is a game-changer for people learning a new language. Imagine a few years from now that people can run this locally on their phones. They can point their camera at objects and talk about them. And this model is multi-lingual, so people can always fallback to their native language if they want. This is essentially what OpenAI demoed a few years ago.
+My first attempt was to fine-tune Gemma 4 12B to behave like a full-duplex model. Something like grafting a decision tick + speech head to the model. It failed after multiple trials. For now, I think a classic cascade system is still better. We just need to wait until a benevolent frontier AI company releases a full-duplex model that's on par with GPT-Live.
 
 ## AI disclosure
 
 This software is developed with strong assistance from Claude and with humans leading the ideas, testing, and debugging. We say this openly because it shaped how the project was built. If you are not happy with AI-developed code, this software is not for you.
+
+The same goes for this README: everything above this section is human-written; everything from here down is AI-drafted and human-reviewed.
 
 ## How it works
 
