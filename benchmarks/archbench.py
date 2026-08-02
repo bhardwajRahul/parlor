@@ -1,5 +1,6 @@
-"""Action-architecture benchmark: in-band control tags (production) vs a
-decoupled JSON action head (a second request over the cached prefix).
+"""Action-architecture benchmark: in-band control tags (the retired
+baseline) vs a decoupled JSON action head (a second request over the
+cached prefix).
 
 The question: should actions (timer, mode switch, research delegation)
 ride the speech stream as tags the TagFilter must excise — or be decided
@@ -7,14 +8,16 @@ by a separate grammar-forced JSON request that can never be spoken, runs
 at temperature 0 regardless of speech temperature, and sees the model's
 own reply as evidence?
 
-    Arch A (tags):  production system prompt + MODE_SUFFIX; reply parsed
-                    by the real StreamParser; tag values through
-                    server.parse_timer. What ships today.
-    Arch B (head):  speech request with a light capability note and NO
-                    tag machinery; then a second request — same cached
+    Arch A (tags):  the retired tag prompts + MODE_SUFFIX (vendored in
+                    legacy_tags); reply parsed by the vendored TagFilter;
+                    tag values through legacy_tags.parse_timer. The
+                    historical baseline.
+    Arch B (head):  speech request with production's capability notes and
+                    NO tag machinery; then a second request — same cached
                     prefix + the reply + a decider instruction — forced
                     to a flat JSON schema at temp 0. The model itself
-                    converts "twenty minutes" to 1200 seconds.
+                    converts "twenty minutes" to 1200 seconds. What ships
+                    today (src/parlor/actions.py).
 
 Per arch: recall (action detected on positives), misfire (action on
 negatives), value_ok (exact seconds / exact mode / usable task), leak
@@ -40,9 +43,11 @@ from pathlib import Path
 os.environ.setdefault("LLAMA_PORT", "8099")
 
 import fixtures  # noqa: E402
+import legacy_tags  # noqa: E402
 from tagbench import TIMER_CASES, TIMER_PLAIN_CASES, ensure_fixtures  # noqa: E402
+from parlor import actions  # noqa: E402
 from parlor import llama  # noqa: E402
-from parlor.pipeline import StreamParser, audio_part, text_part  # noqa: E402
+from parlor.pipeline import audio_part, text_part  # noqa: E402
 from parlor import server  # noqa: E402
 
 # ── cases ─────────────────────────────────────────────────────────────────
@@ -80,51 +85,45 @@ EXPECTED: dict[str, tuple | None] = {
 ALL_CASES = (TIMER_CASES | TIMER_PLAIN_CASES | DELEGATE_CASES
              | MODE_CASES | MODE_TRAP_CASES)
 
-# ── arch A: production in-band tags ──────────────────────────────────────
-A_SYSTEM = (server.SYSTEM_PROMPT + server.DELEGATE_INSTRUCTION
-            + server.TIMER_INSTRUCTION)
-A_RESPOND = server.RESPOND_PROMPT.format(camera="") + server.MODE_SUFFIX
+# ── arch A: retired in-band tags (vendored in legacy_tags) ───────────────
+A_SYSTEM = (server.SYSTEM_PROMPT + legacy_tags.DELEGATE_INSTRUCTION
+            + legacy_tags.TIMER_INSTRUCTION)
+A_RESPOND = server.RESPOND_PROMPT.format(camera="") + legacy_tags.MODE_SUFFIX
 
-# ── arch B: pure speech + JSON action head ───────────────────────────────
-# The speech prompt knows the capabilities EXIST (so acks sound natural
-# and never contradict the head) but carries zero tag syntax.
-B_SYSTEM = (server.SYSTEM_PROMPT
-            + " You can also set countdown timers, hand research tasks to a "
-              "background assistant with web access, translate everything "
-              "the user says from now on, or just listen quietly without "
-              "responding. When the user asks for one of these, confirm "
-              "briefly and naturally — the system takes care of making it "
-              "happen.")
+# ── arch B: pure speech + JSON action head (production) ──────────────────
+# Production's own prompts, imported so drift is impossible: the speech
+# prompt knows the capabilities EXIST (so acks sound natural and never
+# contradict the head) but carries zero tag syntax.
+B_SYSTEM = server.SYSTEM_PROMPT + server.CAPABILITY_NOTE + server.RESEARCH_NOTE
 B_RESPOND = server.RESPOND_PROMPT.format(camera="")
 
-HEAD_PROMPT = (
-    "System note (not user audio): you are the action decider. From the "
-    "user's last audio message (the assistant's reply above may help), "
-    "report what the user asked the assistant to DO, as JSON. "
-    "timer_seconds: the countdown duration in seconds if they asked for a "
-    "timer or a timed reminder, else 0. timer_label: a two-or-three-word "
-    "label for it, else empty. mode: the mode they asked to SWITCH TO — "
-    "'translate' (translate everything from now on), 'listen' (just "
-    "listen quietly, don't respond), or 'conversation' (back to normal) — "
-    "the session is already in normal conversation, so mode is 'none' "
-    "unless they asked to change it. research_task: if they asked to "
-    "search, look up, or research something, or asked about anything "
-    "current or changing (weather, news, prices, scores, openings, "
-    "\"right now\", \"today\"), the task restated to stand alone, else "
-    "empty. A duration or topic merely mentioned in passing is NOT a "
-    "request: report an action only when the user asked for it."
+# Production's head prompt and schema (actions.py), in conversation mode —
+# every bench case runs in conversation mode.
+HEAD_PROMPT = actions._HEAD_COMMON.format(
+    mode_clause=actions._MODE_CLAUSES["conversation"])
+HEAD_SCHEMA = actions.HEAD_SCHEMA
+
+# The 1-token gate: a strictly easier question over the same cached
+# prefix. A "no" skips the full head (~1.4s saved on chat turns); a gate
+# miss silently skips a real action, so its recall must measure 1.0
+# before the cascade ships. Kept local to this benchmark: production
+# dropped the gate after this measurement — it said yes on nearly every
+# turn, so it saved nothing.
+GATE_PROMPT = (
+    "System note (not user audio): did the user's last audio message ask "
+    "the assistant to DO something — set a timer or timed reminder, "
+    "switch how the assistant behaves (translate everything, just "
+    "listen, back to normal), or search, look up, or find out something "
+    "current like weather, news, or prices? Merely mentioning a "
+    "duration or topic is not asking. Answer yes or no."
 )
-HEAD_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "timer_seconds": {"type": "integer"},
-        "timer_label": {"type": "string"},
-        "mode": {"type": "string",
-                 "enum": ["none", "translate", "listen", "conversation"]},
-        "research_task": {"type": "string"},
-    },
-    "required": ["timer_seconds", "timer_label", "mode", "research_task"],
-}
+# Object-wrapped on purpose: a top-level bare-string enum generates EMPTY
+# output when the context contains audio (llama.cpp edge, reproduced), and
+# pretty-printing means the budget must fit '{ "answer": "yes" }'.
+GATE_SCHEMA = {"type": "object",
+               "properties": {"answer": {"type": "string",
+                                         "enum": ["yes", "no"]}},
+               "required": ["answer"]}
 
 
 def chat(messages: list, *, max_tokens: int = 256, temperature: float | None = None,
@@ -150,20 +149,20 @@ def chat(messages: list, *, max_tokens: int = 256, temperature: float | None = N
 
 # ── judging ───────────────────────────────────────────────────────────────
 
-def judge_actions(actions: dict, expected: tuple | None, spoken: str) -> dict:
-    """actions: {'timer': (seconds, label)|None, 'mode': str|None,
+def judge_actions(acts: dict, expected: tuple | None, spoken: str) -> dict:
+    """acts: {'timer': (seconds, label)|None, 'mode': str|None,
     'research': str|None} — the arch-neutral decision."""
-    fired = [k for k, v in actions.items() if v]
+    fired = [k for k, v in acts.items() if v]
     detected = bool(fired)
     value_ok = False
     if expected is None:
         value_ok = not detected
-    elif expected[0] == "timer" and actions.get("timer"):
-        value_ok = actions["timer"][0] == expected[1]
-    elif expected[0] == "mode" and actions.get("mode"):
-        value_ok = actions["mode"] == expected[1]
-    elif expected[0] == "research" and actions.get("research"):
-        value_ok = len(actions["research"].split()) >= 3  # server's guard
+    elif expected[0] == "timer" and acts.get("timer"):
+        value_ok = acts["timer"][0] == expected[1]
+    elif expected[0] == "mode" and acts.get("mode"):
+        value_ok = acts["mode"] == expected[1]
+    elif expected[0] == "research" and acts.get("research"):
+        value_ok = len(acts["research"].split()) >= 3  # server's guard
     return {
         "expects_action": expected is not None,
         "detected": detected,
@@ -178,22 +177,19 @@ def judge_actions(actions: dict, expected: tuple | None, spoken: str) -> dict:
 def run_arch_a(wav: str) -> tuple[dict, str, dict]:
     raw = chat([{"role": "system", "content": A_SYSTEM},
                 {"role": "user", "content": [audio_part(wav), text_part(A_RESPOND)]}])
-    p = StreamParser(expect_transcript=True,
-                     control_tags=("delegate", "mode", "timer"))
-    spoken = p.feed(raw)
-    tail, _ = p.finalize()
-    actions: dict = {"timer": None, "mode": None, "research": None}
-    for name, value in p.tags:
+    spoken, tags = legacy_tags.parse_tagged_reply(raw, ("delegate", "mode", "timer"))
+    acts: dict = {"timer": None, "mode": None, "research": None}
+    for name, value in tags:
         if name == "TIMER":
-            seconds, label = server.parse_timer(value)
+            seconds, label = legacy_tags.parse_timer(value)
             if seconds:
-                actions["timer"] = (seconds, label)
+                acts["timer"] = (seconds, label)
         elif name == "MODE" and value.strip().lower() in ("translate", "listen",
                                                           "conversation"):
-            actions["mode"] = value.strip().lower()
+            acts["mode"] = value.strip().lower()
         elif name == "DELEGATE":
-            actions["research"] = value.strip()
-    return actions, " ".join(spoken + tail), {"raw": raw}
+            acts["research"] = value.strip()
+    return acts, spoken, {"raw": raw}
 
 
 def run_arch_b(wav: str) -> tuple[dict, str, dict]:
@@ -210,21 +206,60 @@ def run_arch_b(wav: str) -> tuple[dict, str, dict]:
         head = json.loads(head_raw)
     except ValueError:
         head = {}
-    actions: dict = {"timer": None, "mode": None, "research": None}
+    acts: dict = {"timer": None, "mode": None, "research": None}
     secs = head.get("timer_seconds") or 0
     if 0 < secs <= server.MAX_TIMER_S:
-        actions["timer"] = (secs, head.get("timer_label", ""))
+        acts["timer"] = (secs, head.get("timer_label", ""))
     # "conversation" while already in conversation is the no-op the real
     # server's switch_mode would make of it (every bench case runs in
     # conversation mode) — state-reporting, not an action.
     if head.get("mode") in ("translate", "listen"):
-        actions["mode"] = head["mode"]
+        acts["mode"] = head["mode"]
     if (head.get("research_task") or "").strip():
-        actions["research"] = head["research_task"].strip()
+        acts["research"] = head["research_task"].strip()
     # B's speakable text is the whole reply minus the transcript line —
     # there is nothing to excise, which is the point.
     spoken = reply.split("\n", 1)[1] if "\n" in reply else reply
-    return actions, spoken, {"raw": reply, "head": head_raw, "head_ms": head_ms}
+    return acts, spoken, {"raw": reply, "head": head_raw, "head_ms": head_ms}
+
+
+def run_arch_b_gated(wav: str) -> tuple[dict, str, dict]:
+    """The cascade: speech → 1-token gate → full head only on 'yes'."""
+    speech_msgs = [{"role": "system", "content": B_SYSTEM},
+                   {"role": "user", "content": [audio_part(wav),
+                                                text_part(B_RESPOND)]}]
+    reply = chat(speech_msgs)
+    tail = [{"role": "assistant", "content": reply}]
+    t0 = time.time()
+    verdict = chat(speech_msgs + tail + [{"role": "user", "content": GATE_PROMPT}],
+                   max_tokens=16, temperature=0.0, json_schema=GATE_SCHEMA)
+    gate_ms = round((time.time() - t0) * 1000)
+    try:
+        gate_yes = json.loads(verdict).get("answer") == "yes"
+    except ValueError:
+        gate_yes = True  # unparseable gate → fail open into the full head
+    acts: dict = {"timer": None, "mode": None, "research": None}
+    extra: dict = {"raw": reply, "gate": verdict, "gate_ms": gate_ms,
+                   "gate_yes": gate_yes}
+    if gate_yes:
+        t0 = time.time()
+        head_raw = chat(speech_msgs + tail + [{"role": "user", "content": HEAD_PROMPT}],
+                        max_tokens=64, temperature=0.0, json_schema=HEAD_SCHEMA)
+        extra["head"] = head_raw
+        extra["head_ms"] = round((time.time() - t0) * 1000)
+        try:
+            head = json.loads(head_raw)
+        except ValueError:
+            head = {}
+        secs = head.get("timer_seconds") or 0
+        if 0 < secs <= server.MAX_TIMER_S:
+            acts["timer"] = (secs, head.get("timer_label", ""))
+        if head.get("mode") in ("translate", "listen"):
+            acts["mode"] = head["mode"]
+        if (head.get("research_task") or "").strip():
+            acts["research"] = head["research_task"].strip()
+    spoken = reply.split("\n", 1)[1] if "\n" in reply else reply
+    return acts, spoken, extra
 
 
 def score(results: list[dict]) -> dict:
@@ -241,12 +276,26 @@ def score(results: list[dict]) -> dict:
         head_ms.sort()
         out["head_ms_p50"] = head_ms[len(head_ms) // 2]
         out["head_ms_max"] = head_ms[-1]
+    if any("gate_yes" in r for r in results):
+        # gate_recall must be 1.0 to ship the cascade: a gate miss on a
+        # positive silently skips a real action. A gate "yes" on a
+        # negative only costs one head call — report, don't fail.
+        out["gate_recall"] = round(sum(r["gate_yes"] for r in pos) / len(pos), 3)
+        out["gate_yes_on_neg"] = round(sum(r["gate_yes"] for r in neg) / len(neg), 3)
+        gms = sorted(r["gate_ms"] for r in results)
+        out["gate_ms_p50"] = gms[len(gms) // 2]
     return out
+
+
+RUNNERS = {"A_tags": run_arch_a, "B_head": run_arch_b,
+           "B_gated": run_arch_b_gated}
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--repeat", type=int, default=2)
+    ap.add_argument("--archs", default="A_tags,B_head",
+                    help=f"comma-separated subset of {', '.join(RUNNERS)}")
     ap.add_argument("--out", default="")
     args = ap.parse_args()
 
@@ -255,13 +304,13 @@ def main() -> None:
     try:
         out = {"model": llama.MODEL, "speech_temperature": llama.TEMPERATURE,
                "repeat": args.repeat, "archs": {}}
-        for label, runner in (("A_tags", run_arch_a), ("B_head", run_arch_b)):
+        for label, runner in [(a, RUNNERS[a]) for a in args.archs.split(",")]:
             results = []
             for name, wav in wavs.items():
                 for _ in range(args.repeat):
                     t0 = time.time()
-                    actions, spoken, extra = runner(wav)
-                    r = judge_actions(actions, EXPECTED[name], spoken)
+                    acts, spoken, extra = runner(wav)
+                    r = judge_actions(acts, EXPECTED[name], spoken)
                     r.update({"case": name, **extra})
                     results.append(r)
                     ok = "✓" if (r["value_ok"] and not r["leaked"]) else "✗"

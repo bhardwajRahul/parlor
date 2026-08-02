@@ -8,9 +8,9 @@ spoken back until the user asks for a reply again.
 A mode is data, not behavior: server.py consults these flags instead of
 hardcoding, so a future mode (an interpreter pair, camera narration) is a
 new entry here plus whatever new trigger it needs, not a rewrite of the
-turn loop. Switching is model-driven — the voice model emits a
-<mode>name</mode> control tag when the user asks — with a UI escape hatch
-(the client's mode chip sends set_mode directly).
+turn loop. Switching is decided by the action head (actions.py) judging
+each utterance, with a UI escape hatch (the client's mode chip sends
+set_mode directly).
 """
 
 from dataclasses import dataclass

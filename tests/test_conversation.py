@@ -57,7 +57,7 @@ def test_continuation_merges_held_audio(session):
     assert t.marker == "complete"
     merged = (t.transcription or "").lower()
     assert "ask" in merged and "paris" in merged, f"lost part of the utterance: {merged!r}"
-    # A weather question is delegation bait (DELEGATE_INSTRUCTION): the
+    # A weather question is delegation bait (RESEARCH_NOTE): the
     # reply may answer directly or acknowledge and hand it to the reasoner
     # — either proves the model worked from the full merged utterance.
     reply = t.text.lower()

@@ -1,35 +1,10 @@
-"""Timers: duration parsing (unit) and the e2e path — set by voice, ring
-as a proactive spoken turn, cancel from the UI chip, and ring during
-listen mode (timers are the one background event every mode delivers)."""
+"""Timers e2e — set by voice (the action decider extracts integer
+seconds; there is no server-side duration parsing to unit-test), ring as
+a proactive spoken turn, cancel from the UI chip, and ring during listen
+mode (timers are the one background event every mode delivers)."""
 
-import pytest
 import util
 from util import switch_by_voice
-
-from parlor.server import parse_timer
-
-
-@pytest.mark.parametrize("value,expected", [
-    ("3 minutes | pasta", (180, "pasta")),
-    ("three minutes | pasta", (180, "pasta")),
-    ("pasta | 3 minutes", (180, "pasta")),
-    ("ten minutes", (600, "")),
-    ("forty-five seconds | oven", (45, "oven")),
-    ("twenty-five minutes | pomodoro", (1500, "pomodoro")),
-    ("seventy seconds | eggs", (70, "eggs")),
-    ("1.5 hours | roast", (5400, "roast")),
-    ("half an hour | nap", (1800, "nap")),
-    ("a minute | tea", (60, "tea")),
-    ("10 minutes for the tea", (600, "tea")),
-    ("20 second timer", (20, "timer")),
-])
-def test_parse_timer(value, expected):
-    assert parse_timer(value) == expected
-
-
-@pytest.mark.parametrize("value", ["pasta", "soon | pasta", "0 minutes", ""])
-def test_parse_timer_rejects(value):
-    assert parse_timer(value) == (None, "")
 
 
 def set_timer_turn(session, fixture="cmd_timer_short", tries=2):
