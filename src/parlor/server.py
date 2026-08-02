@@ -746,16 +746,19 @@ async def websocket_endpoint(ws: WebSocket):
                 frame_image = None
                 held_audio = []
 
-                # In translate/listen the reply depends on what the
-                # utterance IS — content to render/transcribe, or a command
-                # to the assistant — so the decision runs BEFORE the turn
-                # (over the primed prefix; a listen turn plays nothing, so
-                # the added beat is invisible). In conversation it runs
-                # AFTER, hidden under TTS playback, with the model's own
-                # confirmation as evidence. Either way it FIRES only after
-                # the turn, gated on no_speech/interrupt like always.
+                # When the decision runs is a latency choice. Conversation
+                # and translate turns speak FIRST and decide after, hidden
+                # under TTS playback — an interpreter must start rendering
+                # immediately, so a translated exit command gets rendered
+                # once and THEN the switch lands (the vanishing chip is
+                # the confirmation). Listen turns decide BEFORE: they play
+                # nothing (the ~2s only delays the on-screen transcript),
+                # and an exit ("what do you think?") must be ANSWERED, not
+                # silently transcribed — the decision picks the prompt.
+                # Either way a decision FIRES only after the turn, gated
+                # on no_speech/interrupt like always.
                 decision = actions.NONE
-                pre_decided = mode.name in MODE_PROMPTS and has_audio
+                pre_decided = mode.name == "listen" and has_audio
                 if pre_decided:
                     decision = await asyncio.get_event_loop().run_in_executor(
                         None, actions.decide_before, history, content, mode.name)
@@ -807,7 +810,11 @@ async def websocket_endpoint(ws: WebSocket):
                     # "asked" to translate everything — measured live), or
                     # the user cut it off: nothing may act.
                     decision = actions.NONE
-                await apply_decision(decision, only_mode=pre_decided)
+                # Outside conversation, only mode exits fire: a translated
+                # or thought-aloud mention of a timer is content, not a
+                # request (the same policy Mode flags encode for research).
+                await apply_decision(decision,
+                                     only_mode=mode.name != "conversation")
                 remember(user_msg, raw_text, no_speech)
                 last_activity["t"] = time.time()
             except DISCONNECT_ERRORS:
