@@ -16,9 +16,9 @@ My first attempt was to fine-tune Gemma 4 12B to behave like a full-duplex model
 
 ## AI disclosure
 
-This software is developed with strong assistance from Claude and with humans leading the ideas, testing, and debugging. We say this openly because it shaped how the project was built. If you are not happy with AI-developed code, this software is not for you.
+This software is developed with strong assistance from Claude and with humans leading the ideas, testing, and debugging. We say this openly because it shaped how the project was built. If you are not happy with AI-developed code, this software is not for you. This disclosure is inspired by [ds4](https://github.com/antirez/ds4/).
 
-The same goes for this README: everything above this section is human-written; everything from here down is AI-drafted and human-reviewed.
+Everything above this section is human-written, everything from here down is AI-generated.
 
 ## How it works
 
