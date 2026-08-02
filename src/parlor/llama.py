@@ -114,15 +114,22 @@ def stop() -> None:
         _proc.terminate()
 
 
-def _chat_body(messages: list, max_tokens: int, stream: bool) -> dict:
+def _chat_body(messages: list, max_tokens: int, stream: bool,
+               temperature: float | None = None,
+               json_schema: dict | None = None) -> dict:
     body = {
         "messages": messages,
         "max_tokens": max_tokens,
-        "temperature": TEMPERATURE,
+        "temperature": TEMPERATURE if temperature is None else temperature,
         "stream": stream,
         "cache_prompt": True,
         "chat_template_kwargs": {"enable_thinking": False},
     }
+    if json_schema:
+        # llama-server compiles the schema to a grammar: the output is
+        # structurally guaranteed to parse (used by the action head).
+        body["response_format"] = {"type": "json_schema",
+                                   "json_schema": {"schema": json_schema}}
     if stream:
         # The final chunk then carries usage.prompt_tokens — the REAL
         # context size, which drives history rotation (estimates drift).
@@ -130,11 +137,15 @@ def _chat_body(messages: list, max_tokens: int, stream: bool) -> dict:
     return body
 
 
-def chat_blocking(messages: list, max_tokens: int) -> str:
+def chat_blocking(messages: list, max_tokens: int,
+                  temperature: float | None = None,
+                  json_schema: dict | None = None) -> str:
     """Non-streaming request; returns the message content ('' on discard)."""
     conn = _connect(timeout=300)
     conn.request("POST", "/v1/chat/completions",
-                 json.dumps(_chat_body(messages, max_tokens, stream=False)),
+                 json.dumps(_chat_body(messages, max_tokens, stream=False,
+                                       temperature=temperature,
+                                       json_schema=json_schema)),
                  {"Content-Type": "application/json"})
     resp = conn.getresponse()
     data = json.loads(resp.read())

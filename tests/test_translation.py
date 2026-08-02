@@ -4,25 +4,7 @@ the spoken command and the UI escape hatch (set_mode).
 """
 
 import util
-
-
-def switch_by_voice(session, fixture, target, tries=2):
-    """Speak a mode-switch command and wait for the server to confirm it;
-    like delegation tags, the model occasionally confirms without emitting
-    the tag at temp 0.7 — one retry keeps the suite stable, two misses is a
-    real regression."""
-    for _ in range(tries):
-        t = session.turn(util.audio(fixture))
-        if t.marker == "incomplete":
-            # smart-turn held the command (conversation-mode gating):
-            # flush it rather than re-speaking, which would double the
-            # utterance into one merged turn.
-            t = session.turn({"type": "flush"})
-        changed = session.wait_for("mode_changed", timeout=10)
-        if changed and changed.get("mode") == target:
-            return
-    raise AssertionError(
-        f"never switched to {target!r} in {tries} tries — last reply {t.text!r}")
+from util import switch_by_voice
 
 
 def test_translation_renders_speech_instead_of_answering(server, session):

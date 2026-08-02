@@ -191,6 +191,7 @@ function connect() {
     removePendingUserBubble();
     delegationChips.forEach(chip => chip.remove());  // tasks died with the server
     delegationChips.clear();
+    clearTimerChips();  // timers died with it too
     setSessionMode('conversation');  // a reconnect starts a fresh session
     clearFlushTimer();
     setStatus('disconnected', 'Disconnected');
@@ -270,6 +271,15 @@ function connect() {
       currentAssistantEl = null;
       removeDelegationChip(msg.id);
       if (state === 'listening') goProcessing();
+    } else if (msg.type === 'timer_started') {
+      addTimerChip(msg.id, msg.label, msg.seconds);
+    } else if (msg.type === 'timer_resolved') {
+      removeTimerChip(msg.id);
+      if (!msg.cancelled) {
+        // The ring follows immediately as a spoken turn, like a delivery.
+        currentAssistantEl = null;
+        if (state === 'listening') goProcessing();
+      }
     }
   };
 }
@@ -303,9 +313,12 @@ function setAssistantMeta(text) {
 }
 
 // ── Session mode (server-driven; the chip's stop button is the escape
-// hatch for when the spoken exit command gets mistranslated) ──
+// hatch for when the spoken exit command gets misheard) ──
+const MODE_LABELS = { translate: 'Translating → English', listen: 'Just listening' };
+
 function setSessionMode(mode) {
-  $('modeChip').hidden = mode !== 'translate';
+  $('modeChip').hidden = mode === 'conversation';
+  $('modeLabel').textContent = MODE_LABELS[mode] || mode;
 }
 
 // ── Delegation chips: a background research task in flight, shown until
@@ -326,6 +339,48 @@ function removeDelegationChip(id) {
   const chip = delegationChips.get(id);
   delegationChips.delete(id);
   if (chip) chip.remove();
+}
+
+// ── Timer chips: a running countdown with a cancel button; the ring
+// arrives later as a normal spoken turn (timer_resolved precedes it). ──
+const timerChips = new Map();  // id → { el, deadline }
+let timerTicker = null;
+
+function addTimerChip(id, label, seconds) {
+  const div = document.createElement('div');
+  div.className = 'timer-chip';
+  div.innerHTML = '<span class="countdown"></span><span class="task"></span>' +
+                  '<button class="timer-cancel" title="Cancel timer">✕</button>';
+  div.querySelector('.task').textContent = label;
+  div.querySelector('.timer-cancel').onclick = () => wsSend({ type: 'cancel_timer', id });
+  messagesDiv.appendChild(div);
+  messagesDiv.scrollTop = messagesDiv.scrollHeight;
+  timerChips.set(id, { el: div, deadline: Date.now() + seconds * 1000 });
+  if (!timerTicker) timerTicker = setInterval(tickTimers, 500);
+  tickTimers();
+}
+
+function removeTimerChip(id) {
+  const chip = timerChips.get(id);
+  timerChips.delete(id);
+  if (chip) chip.el.remove();
+}
+
+function clearTimerChips() {
+  timerChips.forEach(({ el }) => el.remove());
+  timerChips.clear();
+}
+
+function tickTimers() {
+  // The ticker stops itself once the last chip is gone, so removing one is
+  // just a map delete. Countdowns clamp at 0:00 — a ring parked behind a
+  // busy floor shows a finished countdown until the announcement lands.
+  if (!timerChips.size) { clearInterval(timerTicker); timerTicker = null; return; }
+  timerChips.forEach(({ el, deadline }) => {
+    const left = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
+    el.querySelector('.countdown').textContent =
+      `${Math.floor(left / 60)}:${String(left % 60).padStart(2, '0')}`;
+  });
 }
 
 function pendingUserBubble() {
