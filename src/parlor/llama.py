@@ -78,17 +78,20 @@ def _connect(timeout: float) -> http.client.HTTPConnection:
 
 
 # Gemma 4 needs a recent llama.cpp: builds before b9503 lack its audio
-# support or abort loading the E2B/E4B mmproj (upstream #24084; the 12B
-# mmproj needs b9512). An old install otherwise fails with a confusing
-# crash at model load, so the floor is enforced up front.
+# support or abort loading the E2B/E4B mmproj (upstream #24084), and the
+# 12B mmproj needs b9512. An old install otherwise fails with a confusing
+# crash at model load, so the floor is enforced up front, per model.
 MIN_BUILD = 9503
+MODEL_MIN_BUILD = {"12b": 9512}
 
-# Install hints must not assume macOS: brew on darwin, upstream's guide
-# everywhere else.
-_INSTALL_HINT = ("brew install llama.cpp" if sys.platform == "darwin" else
-                 "see https://github.com/ggml-org/llama.cpp/blob/master/docs/install.md")
-_UPGRADE_HINT = ("brew upgrade llama.cpp" if sys.platform == "darwin" else
-                 "see https://github.com/ggml-org/llama.cpp/blob/master/docs/install.md")
+INSTALL_GUIDE = "https://github.com/ggml-org/llama.cpp/blob/master/docs/install.md"
+
+
+def _hint(verb: str) -> str:
+    """brew on macOS, upstream's guide everywhere else."""
+    if sys.platform == "darwin":
+        return f"brew {verb} llama.cpp"
+    return "see " + INSTALL_GUIDE
 
 
 def server_command() -> list[str]:
@@ -102,25 +105,30 @@ def server_command() -> list[str]:
     unified = shutil.which("llama")
     if unified:
         return [unified, "serve"]
-    raise RuntimeError(f"llama-server not found — install llama.cpp: {_INSTALL_HINT}")
+    raise RuntimeError(f"llama-server not found — install llama.cpp: {_hint('install')}")
 
 
-def check_build(cmd: list[str]) -> None:
-    """Refuse to start on a llama.cpp build too old for Gemma 4. The
-    version line looks like 'version: 10150 (dee2a846b)'; a binary that
-    reports nothing parseable (self-built trees print 'version: 0
+def check_build(cmd: list[str], floor: int = MIN_BUILD) -> None:
+    """Refuse to start on a llama.cpp build below the model's floor. The
+    version is probed on the root binary (`llama serve --version` may not
+    exit). Its line looks like 'version: 10150 (dee2a846b)'; a binary
+    that reports nothing parseable (self-built trees print 'version: 0
     (unknown)') is let through — the guard is for stale installs, not
     custom builds."""
     try:
-        out = subprocess.run(cmd + ["--version"], capture_output=True,
-                             text=True, timeout=10)
+        out = subprocess.run([cmd[0], "--version"], capture_output=True,
+                             text=True, timeout=5)
         m = re.search(r"version:\s*(\d+)", out.stderr + out.stdout)
     except (OSError, subprocess.SubprocessError):
         return
-    if m and 0 < int(m.group(1)) < MIN_BUILD:
+    if m and 0 < int(m.group(1)) < floor:
+        # The upgrade advice must match how llama.cpp was installed: brew
+        # never put the unified `llama` binary there.
+        hint = ("re-run the llama.app installer (or see " + INSTALL_GUIDE + ")"
+                if len(cmd) > 1 else _hint("upgrade"))
         raise RuntimeError(
             f"llama.cpp build {m.group(1)} is too old for Gemma 4 audio "
-            f"(needs {MIN_BUILD}+, June 2026) — {_UPGRADE_HINT}")
+            f"(needs {floor}+, June 2026) — {hint}")
 
 
 def start() -> None:
@@ -129,7 +137,7 @@ def start() -> None:
         print(f"Using external llama-server at {URL}")
         return
     cmd = server_command()
-    check_build(cmd)
+    check_build(cmd, MODEL_MIN_BUILD.get(MODEL, MIN_BUILD))
     model, mmproj = resolve_model_paths()
     print(f"Starting llama-server with {Path(model).name} (ctx={CTX})...")
     # Output goes to DEVNULL — un-silence here when debugging llama itself.

@@ -90,8 +90,7 @@ EXPECTED: dict[str, tuple[bool, list[str]]] = {
 }
 
 SYSTEM = server.SYSTEM_PROMPT + server.CAPABILITY_NOTE + server.RESEARCH_NOTE
-RESPOND_CAM = server.RESPOND_PROMPT.format(
-    camera=" Mention what you see on their camera if relevant.")
+RESPOND_CAM = server.RESPOND_PROMPT.format(camera=server.CAMERA_CLAUSE)
 RESPOND_PLAIN = server.RESPOND_PROMPT.format(camera="")
 
 # The production head prompt + schema, extended with one field: does this
@@ -143,10 +142,12 @@ def prime(messages: list) -> int:
     return round((time.time() - t0) * 1000)
 
 
-def run_head(prefix: list) -> tuple[dict, int]:
+def run_head(messages: list) -> tuple[dict, int]:
+    """One grammar-forced head call over an already-built message list —
+    B rides the prompt on the audio message, C appends its own turn."""
     t0 = time.time()
-    raw, _ = chat(prefix + [{"role": "user", "content": HEAD_PROMPT}],
-                  max_tokens=64, temperature=0.0, json_schema=HEAD_SCHEMA)
+    raw, _ = chat(messages, max_tokens=64, temperature=0.0,
+                  json_schema=HEAD_SCHEMA)
     ms = round((time.time() - t0) * 1000)
     try:
         return json.loads(raw), ms
@@ -180,15 +181,9 @@ def run_arch_b(wav: str, img: str) -> tuple[bool, str, None, dict]:
     prime_ms = prime(base + [{"role": "user", "content": [audio_part(wav)]}])
     # decide_before shape: head prompt rides the same user message as the
     # audio, extending the primed prefix.
-    t0 = time.time()
-    raw, _ = chat(base + [{"role": "user",
-                           "content": [audio_part(wav), text_part(HEAD_PROMPT)]}],
-                  max_tokens=64, temperature=0.0, json_schema=HEAD_SCHEMA)
-    head_ms = round((time.time() - t0) * 1000)
-    try:
-        wants = bool(json.loads(raw).get("camera"))
-    except ValueError:
-        wants = False
+    head, head_ms = run_head(base + [
+        {"role": "user", "content": [audio_part(wav), text_part(HEAD_PROMPT)]}])
+    wants = bool(head.get("camera"))
     content = ([image_part(img), audio_part(wav), text_part(RESPOND_CAM)]
                if wants else [audio_part(wav), text_part(RESPOND_PLAIN)])
     t0 = time.time()
@@ -207,7 +202,7 @@ def run_arch_c(wav: str, img: str) -> tuple[bool, str, str | None, dict]:
     reply, pt = chat(speech)
     turn_ms = round((time.time() - t0) * 1000)
     prefix = speech + [{"role": "assistant", "content": reply}]
-    head, head_ms = run_head(prefix)
+    head, head_ms = run_head(prefix + [{"role": "user", "content": HEAD_PROMPT}])
     wants = bool(head.get("camera"))
     extra = {"turn_ms": turn_ms, "head_ms": head_ms, "prime_ms": prime_ms,
              "prompt_tokens": pt, "raw": reply}
@@ -275,9 +270,8 @@ def score(results: list[dict]) -> dict:
             out[f"{key}_p50"] = vals[len(vals) // 2]
     # What the user waits on a VISION turn, per arch: A = turn (frame was
     # primed); B = head + turn; C = turn1 + head + turn2.
-    vis = [r for r in results if r["needs_camera"]]
     waits = [r.get("head_ms", 0) + r.get("turn_ms", 0) + r.get("turn2_ms", 0)
-             for r in vis]
+             for r in pos]
     if waits:
         waits.sort()
         out["vision_wait_ms_p50"] = waits[len(waits) // 2]
