@@ -17,7 +17,7 @@ import urllib.request
 BASE_URL = os.environ.get("REASONER_BASE_URL",
                           "https://openrouter.ai/api/v1").rstrip("/")
 API_KEY = os.environ.get("REASONER_API_KEY", "")
-MODEL = os.environ.get("REASONER_MODEL", "anthropic/claude-sonnet-4.5")
+MODEL = os.environ.get("REASONER_MODEL", "openai/gpt-5.6-luna")
 try:
     TIMEOUT_S = float(os.environ.get("REASONER_TIMEOUT", "90"))
 except ValueError:
@@ -49,13 +49,22 @@ def ask(task: str) -> str:
     """Blocking chat-completion call — run it in an executor. Raises on
     transport/HTTP errors and empty answers; the caller turns any failure
     into a spoken apology."""
+    # api.openai.com rejects max_tokens for its reasoning models and wants
+    # max_completion_tokens; every other OpenAI-compatible endpoint
+    # (OpenRouter, llama-server, vLLM) takes max_tokens. Only the field
+    # name varies: reasoning models spend hidden thinking tokens from the
+    # same budget wherever they run, and the answer stays short because
+    # the system prompt asks for a few spoken sentences — the cap just
+    # stops essays.
+    field = ("max_completion_tokens" if "api.openai.com" in BASE_URL
+             else "max_tokens")
     req = urllib.request.Request(
         BASE_URL + "/chat/completions",
         data=json.dumps({
             "model": MODEL,
             "messages": [{"role": "system", "content": SYSTEM_PROMPT},
                          {"role": "user", "content": task}],
-            "max_tokens": 1024,  # the answer is spoken aloud — cap essays
+            field: 4096,
         }).encode(),
         headers={"Content-Type": "application/json",
                  "Authorization": f"Bearer {API_KEY}"},

@@ -16,6 +16,10 @@ The obvious answer: run everything on-device, eliminating any server cost. Six m
 
 Google just released a super capable small model that I can run on my M3 Pro in real-time, with vision too! Sure you can't do agentic coding with this, but it is a game-changer for people learning a new language. Imagine a few years from now that people can run this locally on their phones. They can point their camera at objects and talk about them. And this model is multi-lingual, so people can always fallback to their native language if they want. This is essentially what OpenAI demoed a few years ago.
 
+## AI disclosure
+
+This software is developed with strong assistance from Claude and with humans leading the ideas, testing, and debugging. We say this openly because it shaped how the project was built. If you are not happy with AI-developed code, this software is not for you.
+
 ## How it works
 
 ```
@@ -24,30 +28,31 @@ Browser (mic + camera)
     │  WebSocket (audio PCM + JPEG frames)
     ▼
 FastAPI server
-    ├── Gemma 4 E4B via llama.cpp (QAT q4_0)  →  understands speech + vision
-    └── Kokoro TTS (MLX on Mac, ONNX on Linux)  →  speaks back
+    ├── smart-turn-v3 (~20ms)                   →  did you finish your thought?
+    ├── Gemma 4 E4B via llama.cpp (QAT q4_0)    →  hears + sees, streams the reply
+    │     └── action head (same model, JSON)    →  timers · modes · research
+    ├── Kokoro TTS (MLX on Mac, ONNX on Linux)  →  speaks sentence-by-sentence
+    └── background reasoner (optional)          →  frontier model for web research
     │
-    │  WebSocket (streamed audio chunks)
+    │  WebSocket (transcript + streamed audio chunks)
     ▼
 Browser (playback + transcript)
 ```
 
-- **Voice Activity Detection** in the browser ([Silero VAD](https://github.com/ricky0123/vad)). Hands-free, no push-to-talk, with a short 200ms silence cutoff for fast turn-taking.
-- **Turn-completeness filtering.** Pipecat's [smart-turn-v3](https://huggingface.co/pipecat-ai/smart-turn-v3) audio classifier (~20ms on CPU) judges whether you finished your thought before the LLM answers — if you were cut off or paused to think, it stays quiet and lets you continue. If you then stay silent, the held audio is flushed to the model, which either answers it or warmly asks you to finish.
-- **Streaming decode → TTS.** The reply opens with a one-line transcript of what you said (committing to it first measurably improves both transcript and response accuracy, and it appears on screen immediately), then the response is spoken sentence-by-sentence while the model is still generating.
-- **Speculative prefill during speech.** The camera frame is sent the moment you start speaking, and your speech itself streams to the server in ~3s chunks — both are pushed through llama.cpp's prompt cache while you're still talking, so at the end of a long question almost everything is already processed.
-- **Barge-in.** Interrupt the AI mid-sentence by speaking; generation is aborted server-side. Echo is handled without the browser's echo canceller (which muffles both the TTS voice and your barge-in on macOS): a sustained-speech gate plus a prompt rule — or just wear headphones.
-- **Background research delegation** (optional). Ask something that needs web search or real reasoning — "find the best pizza in Rome right now" — and the local model hands the task to a frontier model on any OpenAI-compatible endpoint (OpenRouter by default, with web search), keeps the conversation going, and speaks the answer when it comes back. Off unless `REASONER_API_KEY` is set; without it Parlor stays fully on-device.
-- **Live translation mode.** Say "translate everything I say into English" and Parlor becomes a consecutive interpreter: each utterance is rendered in English after a short silence window (no turn-completeness holds, no conversational replies), in any language Gemma understands. Say "stop translating" — or hit the stop chip — to return to conversation. One-way into English for now; the TTS voice is per-mode, so more Kokoro output languages are a config away.
-- **Just-listen mode.** Say "just listen for a while, I want to think out loud" and Parlor becomes a silent scribe: every utterance is transcribed on screen but nothing is spoken back — no replies, no holds — until you address it again ("okay, what do you think?") or hit the stop chip.
-- **Timers.** "Set a timer for three minutes for the pasta" — the model confirms naturally; the server owns the clock and, when it goes off, the model announces it out loud (waiting out anything currently playing, in any mode). A countdown chip with a cancel button tracks it in the transcript. Measured first (`benchmarks/timerprobe.py`): without this machinery the model promises timers 6/6 but announces them 1/6 even when told how much time passed — a turn-based model can't ring into silence, so the server must own the clock.
-- **A decoupled action decider.** The spoken reply is pure speech — no control markup ever rides it. What the user *asked for* (a timer, a mode switch, research) is decided by a separate grammar-forced JSON request over the same llama.cpp prefix cache, at temperature 0, with the model's own confirmation as evidence, while TTS is already playing. Measured against in-band control tags (`benchmarks/archbench.py`): recall 1.0 vs 0.955, where the tags' miss is the worst voice-assistant failure — a spoken promise ("I will be quiet") the server never keeps. It also makes leaks structurally impossible and durations multilingual (the model outputs integer seconds).
-- **A sense of elapsed time.** After a real gap, the next turn tells the model how much quiet preceded it ("about 2 minutes"), delegation deliveries say how long the research took, and the system prompt anchors when the session started — so "how long was I gone?" gets a real answer.
+- **Background research** (optional). "Find the best pizza in Rome right now" hands the task to a frontier model on any OpenAI-compatible endpoint (OpenRouter + web search by default) while the conversation continues; the answer is spoken when it arrives. Off unless `REASONER_API_KEY` is set — without it Parlor stays fully on-device.
+- **Hands-free turn-taking.** Browser-side [Silero VAD](https://github.com/ricky0123/vad) with a ~200ms silence cutoff — no push-to-talk. Pipecat's [smart-turn-v3](https://huggingface.co/pipecat-ai/smart-turn-v3) then judges whether you actually finished your thought: mid-thought pauses are held silently until you continue, or answered once you stay quiet.
+- **Everything streams.** The reply opens with a transcript of what was heard (on screen immediately — committing to it first measurably improves accuracy), then is spoken sentence-by-sentence while still generating. Your camera frame and speech are pushed through llama.cpp's prompt cache while you're still talking, so even long questions start answering almost instantly.
+- **Barge-in.** Speak over the AI to interrupt it; generation is aborted server-side. Echo is handled without the browser's echo canceller — or just wear headphones.
+- **Actions never ride the speech.** Timers, mode switches, and research requests are decided by a separate grammar-forced JSON request over the same prompt cache, hidden under TTS playback. The spoken reply stays pure speech, so control markup can never leak into TTS and a promise made aloud is always kept (recall 1.0 vs 0.955 for in-band tags — `benchmarks/archbench.py`).
+- **Timers.** "Set a timer for three minutes for the pasta" — the server owns the clock (a turn-based model can't ring into silence — `benchmarks/timerprobe.py`), the model announces the ring out loud in any mode, and a countdown chip with a cancel button tracks it.
+- **Live translation mode.** "Translate everything I say into English" turns Parlor into a consecutive interpreter: each utterance rendered after a short silence, no conversational replies, in any language Gemma understands — until you say "stop translating" or hit the stop chip.
+- **Just-listen mode.** "Just listen for a while, I want to think out loud" makes it a silent scribe: every utterance transcribed on screen, nothing spoken back, until you address it again.
+- **A sense of time.** The model is told how much quiet preceded a turn, how long research took, and when the session started — so "how long was I gone?" gets a real answer.
 
 ## Requirements
 
 - Python 3.12+
-- [llama.cpp](https://github.com/ggml-org/llama.cpp) (`brew install llama.cpp` on macOS; other platforms: [install guide](https://github.com/ggml-org/llama.cpp/blob/master/docs/install.md))
+- [llama.cpp](https://github.com/ggml-org/llama.cpp) (`brew install llama.cpp` on macOS; other platforms: [install guide](https://github.com/ggml-org/llama.cpp/blob/master/docs/install.md)). Needs build b9503 (June 2026) or newer, b9512 for `MODEL=12b` — older builds lack Gemma 4 audio or crash loading its mmproj
 - macOS with Apple Silicon, or Linux with a supported GPU
 - ~6 GB free RAM for the default E4B model (`MODEL=e2b` fits in ~4 GB)
 
@@ -71,22 +76,17 @@ Models are downloaded automatically on first run (~5.7 GB for Gemma 4 E4B QAT + 
 
 ## Configuration
 
+Set these in your shell or a `.env` at the repo root. The common ones:
+
 | Variable           | Default                        | Description                                    |
 | ------------------ | ------------------------------ | ---------------------------------------------- |
 | `MODEL`            | `e4b`                          | Gemma 4 size: `e2b` (fastest), `e4b` (better answers, ~1.8x e2b latency), `12b` (needs ~8GB) |
-| `MODEL_PATH`       | auto-download from HuggingFace | Path to a local Gemma 4 `.gguf` file (overrides `MODEL`) |
-| `MMPROJ_PATH`      | auto-download from HuggingFace | Path to the matching `mmproj` `.gguf` (audio + vision encoders) |
 | `PORT`             | `8000`                         | Server port                                    |
-| `TEMPERATURE`      | `0.7`                          | Sampling temperature (0 = deterministic)       |
-| `LLAMA_CTX`        | `16384`                        | llama.cpp context size. The server drops the oldest exchanges shortly before it fills |
-| `TIME_NOTE_MIN_S`  | `120`                          | Seconds of quiet before a turn carries an elapsed-time note |
-| `LLAMA_PORT`       | `8081`                         | Port for the spawned llama-server              |
-| `LLAMA_SERVER_URL` | (spawn our own)                | Use an already-running llama-server instead    |
-| `REASONER_API_KEY` | (unset — delegation off)       | API key for the background reasoner endpoint   |
+| `REASONER_API_KEY` | (unset — research off)         | API key enabling background research           |
 | `REASONER_BASE_URL`| `https://openrouter.ai/api/v1` | Any OpenAI-compatible chat endpoint            |
-| `REASONER_MODEL`   | `anthropic/claude-sonnet-4.5`  | Model the endpoint should run                  |
-| `REASONER_WEB_SEARCH` | `1`                         | On OpenRouter, append `:online` for web search |
-| `REASONER_TIMEOUT` | `90`                           | Seconds before a background task fails         |
+| `REASONER_MODEL`   | `openai/gpt-5.6-luna`          | Model the endpoint should run                  |
+
+The full list — local model paths, llama.cpp tuning, TTS backend, test hooks — is in [docs/configuration.md](docs/configuration.md).
 
 ## Performance (Apple M3 Pro)
 
@@ -133,7 +133,7 @@ src/parlor/
 ├── pipeline.py            # Streaming turn pipeline (decode → sentences → TTS)
 ├── actions.py             # Action decider (grammar-forced JSON: timers, modes, research)
 ├── reasoner.py            # Background research delegation (OpenAI-compatible)
-├── modes.py               # Session modes (conversation, translate)
+├── modes.py               # Session modes (conversation, translate, listen)
 ├── turn_detector.py       # smart-turn-v3 end-of-turn classifier
 ├── tts.py                 # Platform-aware TTS (MLX on Mac, ONNX on Linux)
 └── web/                   # Frontend (markup, styles, app logic: VAD, camera, playback)
@@ -142,7 +142,10 @@ benchmarks/
 ├── bench.py               # End-to-end latency benchmark
 ├── fixtures.py            # Spoken-audio fixtures (synthesized locally)
 ├── compare.py             # Diff two benchmark result files
-└── turnbench.py           # Turn-detection accuracy benchmark
+├── turnbench.py           # Turn-detection accuracy benchmark
+├── archbench.py           # In-band control tags vs decoupled action head
+├── camerabench.py         # Attach-every-turn vs camera-as-tool-call
+└── timerprobe.py          # Why the server owns the timer clock
 ```
 
 ## Acknowledgments

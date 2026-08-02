@@ -203,6 +203,10 @@ RESPOND_PROMPT = (
     "to them: 1-4 short sentences, spoken aloud.{camera}"
 )
 
+# The clause a camera turn appends to its instruction — a named constant
+# so benchmarks measure the production wording, never a retyped copy.
+CAMERA_CLAUSE = " Mention what you see on their camera if relevant."
+
 # Spoken when a turn yields no reply at all (models of every size
 # occasionally emit only the transcript line) — silence would leave the
 # user hanging, and a stored transcript-only reply teaches the model to
@@ -317,7 +321,7 @@ async def root():
 
 def turn_instruction(msg: dict, has_image: bool, has_audio: bool) -> str:
     if has_audio:
-        camera = " Mention what you see on their camera if relevant." if has_image else ""
+        camera = CAMERA_CLAUSE if has_image else ""
         prompt = FLUSH_PROMPT if msg.get("type") == "flush" else RESPOND_PROMPT
         return prompt.format(camera=camera)
     if has_image:
