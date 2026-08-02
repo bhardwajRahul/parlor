@@ -4,9 +4,11 @@ OpenAI-compatible chat API (blocking, streaming, and cache-priming)."""
 import http.client
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -75,20 +77,65 @@ def _connect(timeout: float) -> http.client.HTTPConnection:
     return http.client.HTTPConnection(*host_port(), timeout=timeout)
 
 
+# Gemma 4 needs a recent llama.cpp: builds before b9503 lack its audio
+# support or abort loading the E2B/E4B mmproj (upstream #24084; the 12B
+# mmproj needs b9512). An old install otherwise fails with a confusing
+# crash at model load, so the floor is enforced up front.
+MIN_BUILD = 9503
+
+# Install hints must not assume macOS: brew on darwin, upstream's guide
+# everywhere else.
+_INSTALL_HINT = ("brew install llama.cpp" if sys.platform == "darwin" else
+                 "see https://github.com/ggml-org/llama.cpp/blob/master/docs/install.md")
+_UPGRADE_HINT = ("brew upgrade llama.cpp" if sys.platform == "darwin" else
+                 "see https://github.com/ggml-org/llama.cpp/blob/master/docs/install.md")
+
+
+def server_command() -> list[str]:
+    """The llama.cpp server invocation. Homebrew and the release tarballs
+    install `llama-server`; llama.cpp's first-party installer
+    (llama.app/install.sh) instead ships a unified `llama` binary whose
+    `serve` subcommand is the same server."""
+    binary = shutil.which("llama-server")
+    if binary:
+        return [binary]
+    unified = shutil.which("llama")
+    if unified:
+        return [unified, "serve"]
+    raise RuntimeError(f"llama-server not found — install llama.cpp: {_INSTALL_HINT}")
+
+
+def check_build(cmd: list[str]) -> None:
+    """Refuse to start on a llama.cpp build too old for Gemma 4. The
+    version line looks like 'version: 10150 (dee2a846b)'; a binary that
+    reports nothing parseable (self-built trees print 'version: 0
+    (unknown)') is let through — the guard is for stale installs, not
+    custom builds."""
+    try:
+        out = subprocess.run(cmd + ["--version"], capture_output=True,
+                             text=True, timeout=10)
+        m = re.search(r"version:\s*(\d+)", out.stderr + out.stdout)
+    except (OSError, subprocess.SubprocessError):
+        return
+    if m and 0 < int(m.group(1)) < MIN_BUILD:
+        raise RuntimeError(
+            f"llama.cpp build {m.group(1)} is too old for Gemma 4 audio "
+            f"(needs {MIN_BUILD}+, June 2026) — {_UPGRADE_HINT}")
+
+
 def start() -> None:
     global _proc
     if URL:
         print(f"Using external llama-server at {URL}")
         return
-    binary = shutil.which("llama-server")
-    if not binary:
-        raise RuntimeError("llama-server not found — install with: brew install llama.cpp")
+    cmd = server_command()
+    check_build(cmd)
     model, mmproj = resolve_model_paths()
     print(f"Starting llama-server with {Path(model).name} (ctx={CTX})...")
     # Output goes to DEVNULL — un-silence here when debugging llama itself.
     _proc = subprocess.Popen(
-        [binary, "-m", model, "--mmproj", mmproj, "-ngl", "99",
-         "--port", str(PORT), "-c", str(CTX), "-np", "1"],
+        cmd + ["-m", model, "--mmproj", mmproj, "-ngl", "99",
+               "--port", str(PORT), "-c", str(CTX), "-np", "1"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     deadline = time.time() + 180
