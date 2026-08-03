@@ -5,6 +5,7 @@ description = "On-device, real-time multimodal AI — have natural voice + visio
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "fastapi>=0.135.3",
+    "huggingface-hub>=1.0.0",
     "kokoro-onnx>=0.5.0; sys_platform == 'linux'",
     "misaki[en]>=0.9.4; sys_platform == 'darwin'",
     "mlx-audio>=0.4.2; sys_platform == 'darwin'",
